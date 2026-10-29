@@ -1,0 +1,250 @@
+{"v":1,"req":"fixture-short-answer","seq":0,"t_ns":1000000000,"type":"request.received","model":"mock-llama:1b","prompt_chars":216,"options":{"temperature":0.8,"top_k":40,"top_p":0.9,"min_p":0,"repeat_penalty":1.1,"num_predict":20},"detail":"layers"}
+{"v":1,"req":"fixture-short-answer","seq":1,"t_ns":1000300000,"type":"model.load","phase":"start","layers":8,"ctx":4096,"vram_mb":1632}
+{"v":1,"req":"fixture-short-answer","seq":2,"t_ns":1800300000,"type":"model.load","phase":"done","layers":8,"ctx":4096,"vram_mb":1632,"ms":800}
+{"v":1,"req":"fixture-short-answer","seq":3,"t_ns":1802300000,"type":"tokenize.done","n":54,"tokens":[{"id":685,"text":"<|begin|>"},{"id":686,"text":"<|user|>"},{"id":10,"text":"\n"},{"id":69,"text":"E"},{"id":575,"text":"xplain"},{"id":44,"text":","},{"id":281,"text":" step"},{"id":402,"text":" by"},{"id":281,"text":" step"},{"id":44,"text":","},{"id":624,"text":" how"},{"id":257,"text":" a"},{"id":628,"text":" large"},{"id":407,"text":" language"},{"id":304,"text":" model"},{"id":672,"text":" turns"},{"id":637,"text":" my"},{"id":349,"text":" prompt"},{"id":346,"text":" into"},{"id":271,"text":" an"},{"id":602,"text":" answer"},{"id":46,"text":"."},{"id":424,"text":" A"},{"id":407,"text":" language"},{"id":304,"text":" model"},{"id":653,"text":" reads"},{"id":679,"text":" your"},{"id":349,"text":" prompt"},{"id":317,"text":" as"},{"id":257,"text":" a"},{"id":658,"text":" sequence"},{"id":314,"text":" of"},{"id":422,"text":" tokens"},{"id":46,"text":"."},{"id":578,"text":" First"},{"id":263,"text":" the"},{"id":669,"text":" text"},{"id":302,"text":" is"},{"id":661,"text":" split"},{"id":346,"text":" into"},{"id":649,"text":" pieces"},{"id":44,"text":","},{"id":280,"text":" and"},{"id":303,"text":" each"},{"id":415,"text":" piece"},{"id":608,"text":" becomes"},{"id":271,"text":" an"},{"id":626,"text":" integer"},{"id":586,"text":" id"},{"id":46,"text":"."},{"id":688,"text":"<|end|>"},{"id":10,"text":"\n"},{"id":687,"text":"<|assistant|>"},{"id":10,"text":"\n"}]}
+{"v":1,"req":"fixture-short-answer","seq":4,"t_ns":1891634927,"type":"prefill.batch","batch_i":0,"of":4,"from":0,"to":16,"ms":44.667}
+{"v":1,"req":"fixture-short-answer","seq":5,"t_ns":1968280638,"type":"prefill.batch","batch_i":1,"of":4,"from":16,"to":32,"ms":38.323}
+{"v":1,"req":"fixture-short-answer","seq":6,"t_ns":2043026893,"type":"prefill.batch","batch_i":2,"of":4,"from":32,"to":48,"ms":37.373}
+{"v":1,"req":"fixture-short-answer","seq":7,"t_ns":2070633379,"type":"prefill.batch","batch_i":3,"of":4,"from":48,"to":54,"ms":13.803}
+{"v":1,"req":"fixture-short-answer","seq":8,"t_ns":2070633379,"type":"prefill.done","n_tokens":54,"ms":268.333}
+{"v":1,"req":"fixture-short-answer","seq":9,"t_ns":2070633379,"type":"decode.step.start","step":0,"kv_used":54,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":10,"t_ns":2072099469,"type":"decode.layer","step":0,"layer":0,"ms":1.416,"norm":4.83}
+{"v":1,"req":"fixture-short-answer","seq":11,"t_ns":2072984618,"type":"decode.layer","step":0,"layer":1,"ms":0.885,"norm":6.471}
+{"v":1,"req":"fixture-short-answer","seq":12,"t_ns":2074566311,"type":"decode.layer","step":0,"layer":2,"ms":1.582,"norm":7.965}
+{"v":1,"req":"fixture-short-answer","seq":13,"t_ns":2075716051,"type":"decode.layer","step":0,"layer":3,"ms":1.15,"norm":9.094}
+{"v":1,"req":"fixture-short-answer","seq":14,"t_ns":2077487563,"type":"decode.layer","step":0,"layer":4,"ms":1.772,"norm":9.919}
+{"v":1,"req":"fixture-short-answer","seq":15,"t_ns":2078981541,"type":"decode.layer","step":0,"layer":5,"ms":1.494,"norm":11.318}
+{"v":1,"req":"fixture-short-answer","seq":16,"t_ns":2080408625,"type":"decode.layer","step":0,"layer":6,"ms":1.427,"norm":12.011}
+{"v":1,"req":"fixture-short-answer","seq":17,"t_ns":2082496338,"type":"decode.layer","step":0,"layer":7,"ms":2.088,"norm":14.148}
+{"v":1,"req":"fixture-short-answer","seq":18,"t_ns":2082496338,"type":"decode.logits","step":0,"topk":[{"id":65,"text":"A","p":0.99897},{"id":130,"text":"�","p":0.00023},{"id":433,"text":"-forwar","p":0.00021},{"id":16,"text":"\u0010","p":0.00015},{"id":230,"text":"�","p":0.00009},{"id":662,"text":" stops","p":0.00006},{"id":574,"text":"ummarize","p":0.00005},{"id":353,"text":"-entrop","p":0.00004},{"id":224,"text":"�","p":0.00003},{"id":347,"text":" lo","p":0.00002}],"entropy":0.011}
+{"v":1,"req":"fixture-short-answer","seq":19,"t_ns":2083696463,"type":"decode.sample","step":0,"chosen_id":65,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":20,"t_ns":2084246526,"type":"decode.token","step":0,"text":"A","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":21,"t_ns":2084246526,"type":"decode.step.start","step":1,"kv_used":55,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":22,"t_ns":2085948296,"type":"decode.layer","step":1,"layer":0,"ms":1.652,"norm":6.607}
+{"v":1,"req":"fixture-short-answer","seq":23,"t_ns":2087332745,"type":"decode.layer","step":1,"layer":1,"ms":1.384,"norm":8.371}
+{"v":1,"req":"fixture-short-answer","seq":24,"t_ns":2088231220,"type":"decode.layer","step":1,"layer":2,"ms":0.898,"norm":9.627}
+{"v":1,"req":"fixture-short-answer","seq":25,"t_ns":2089655706,"type":"decode.layer","step":1,"layer":3,"ms":1.424,"norm":11.168}
+{"v":1,"req":"fixture-short-answer","seq":26,"t_ns":2091367410,"type":"decode.layer","step":1,"layer":4,"ms":1.712,"norm":12.387}
+{"v":1,"req":"fixture-short-answer","seq":27,"t_ns":2092574950,"type":"decode.layer","step":1,"layer":5,"ms":1.208,"norm":13.811}
+{"v":1,"req":"fixture-short-answer","seq":28,"t_ns":2093536142,"type":"decode.layer","step":1,"layer":6,"ms":0.961,"norm":15.102}
+{"v":1,"req":"fixture-short-answer","seq":29,"t_ns":2095068086,"type":"decode.layer","step":1,"layer":7,"ms":1.532,"norm":17.349}
+{"v":1,"req":"fixture-short-answer","seq":30,"t_ns":2095068086,"type":"decode.logits","step":1,"topk":[{"id":564,"text":"reaming","p":0.39989},{"id":407,"text":" language","p":0.32524},{"id":106,"text":"j","p":0.2533},{"id":355,"text":"ache","p":0.00381},{"id":194,"text":"�","p":0.00265},{"id":611,"text":" cache","p":0.00251},{"id":186,"text":"�","p":0.00206},{"id":593,"text":" Low","p":0.00197},{"id":73,"text":"I","p":0.00158},{"id":533,"text":"ills","p":0.00151}],"entropy":1.223}
+{"v":1,"req":"fixture-short-answer","seq":31,"t_ns":2096232099,"type":"decode.sample","step":1,"chosen_id":407,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":32,"t_ns":2096764106,"type":"decode.token","step":1,"text":" language","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":33,"t_ns":2096764106,"type":"decode.step.start","step":2,"kv_used":56,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":34,"t_ns":2098434888,"type":"decode.layer","step":2,"layer":0,"ms":1.621,"norm":6.023}
+{"v":1,"req":"fixture-short-answer","seq":35,"t_ns":2099993835,"type":"decode.layer","step":2,"layer":1,"ms":1.559,"norm":7.189}
+{"v":1,"req":"fixture-short-answer","seq":36,"t_ns":2101264619,"type":"decode.layer","step":2,"layer":2,"ms":1.271,"norm":8.163}
+{"v":1,"req":"fixture-short-answer","seq":37,"t_ns":2102680755,"type":"decode.layer","step":2,"layer":3,"ms":1.416,"norm":9.302}
+{"v":1,"req":"fixture-short-answer","seq":38,"t_ns":2103436557,"type":"decode.layer","step":2,"layer":4,"ms":0.756,"norm":10.425}
+{"v":1,"req":"fixture-short-answer","seq":39,"t_ns":2104570295,"type":"decode.layer","step":2,"layer":5,"ms":1.134,"norm":11.477}
+{"v":1,"req":"fixture-short-answer","seq":40,"t_ns":2105195152,"type":"decode.layer","step":2,"layer":6,"ms":0.625,"norm":12.985}
+{"v":1,"req":"fixture-short-answer","seq":41,"t_ns":2106211622,"type":"decode.layer","step":2,"layer":7,"ms":1.016,"norm":14.453}
+{"v":1,"req":"fixture-short-answer","seq":42,"t_ns":2106211622,"type":"decode.logits","step":2,"topk":[{"id":304,"text":" model","p":0.99694},{"id":428,"text":"-p","p":0.00232},{"id":464,"text":"abilities","p":0.00027},{"id":450,"text":"Quant","p":0.00012},{"id":628,"text":" large","p":0.00012},{"id":67,"text":"C","p":0.00004},{"id":544,"text":"mor","p":0.00003},{"id":291,"text":" h","p":0.00002},{"id":122,"text":"z","p":0.00002},{"id":416,"text":" so","p":0.00002}],"entropy":0.024}
+{"v":1,"req":"fixture-short-answer","seq":43,"t_ns":2107437818,"type":"decode.sample","step":2,"chosen_id":304,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":44,"t_ns":2108000917,"type":"decode.token","step":2,"text":" model","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":45,"t_ns":2108000917,"type":"decode.step.start","step":3,"kv_used":57,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":46,"t_ns":2109654812,"type":"decode.layer","step":3,"layer":0,"ms":1.604,"norm":6.041}
+{"v":1,"req":"fixture-short-answer","seq":47,"t_ns":2110979971,"type":"decode.layer","step":3,"layer":1,"ms":1.325,"norm":6.45}
+{"v":1,"req":"fixture-short-answer","seq":48,"t_ns":2112452543,"type":"decode.layer","step":3,"layer":2,"ms":1.473,"norm":8.131}
+{"v":1,"req":"fixture-short-answer","seq":49,"t_ns":2113719759,"type":"decode.layer","step":3,"layer":3,"ms":1.267,"norm":9.151}
+{"v":1,"req":"fixture-short-answer","seq":50,"t_ns":2115118174,"type":"decode.layer","step":3,"layer":4,"ms":1.398,"norm":10.301}
+{"v":1,"req":"fixture-short-answer","seq":51,"t_ns":2116611716,"type":"decode.layer","step":3,"layer":5,"ms":1.494,"norm":11.532}
+{"v":1,"req":"fixture-short-answer","seq":52,"t_ns":2117946340,"type":"decode.layer","step":3,"layer":6,"ms":1.335,"norm":12.843}
+{"v":1,"req":"fixture-short-answer","seq":53,"t_ns":2118661431,"type":"decode.layer","step":3,"layer":7,"ms":0.715,"norm":13.969}
+{"v":1,"req":"fixture-short-answer","seq":54,"t_ns":2118661431,"type":"decode.logits","step":3,"topk":[{"id":653,"text":" reads","p":0.16062},{"id":459,"text":"am","p":0.14783},{"id":189,"text":"�","p":0.12509},{"id":453,"text":"TF","p":0.08137},{"id":215,"text":"�","p":0.0676},{"id":185,"text":"�","p":0.05025},{"id":320,"text":"ag","p":0.04513},{"id":135,"text":"�","p":0.03159},{"id":392,"text":" S","p":0.02995},{"id":255,"text":"�","p":0.02363}],"entropy":2.925}
+{"v":1,"req":"fixture-short-answer","seq":55,"t_ns":2119802362,"type":"decode.sample","step":3,"chosen_id":653,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":56,"t_ns":2120322827,"type":"decode.token","step":3,"text":" reads","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":57,"t_ns":2120322827,"type":"decode.step.start","step":4,"kv_used":58,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":58,"t_ns":2122272714,"type":"decode.layer","step":4,"layer":0,"ms":1.9,"norm":5.196}
+{"v":1,"req":"fixture-short-answer","seq":59,"t_ns":2123622402,"type":"decode.layer","step":4,"layer":1,"ms":1.35,"norm":6.263}
+{"v":1,"req":"fixture-short-answer","seq":60,"t_ns":2124515848,"type":"decode.layer","step":4,"layer":2,"ms":0.893,"norm":7.529}
+{"v":1,"req":"fixture-short-answer","seq":61,"t_ns":2125556375,"type":"decode.layer","step":4,"layer":3,"ms":1.041,"norm":8.93}
+{"v":1,"req":"fixture-short-answer","seq":62,"t_ns":2127049493,"type":"decode.layer","step":4,"layer":4,"ms":1.493,"norm":9.57}
+{"v":1,"req":"fixture-short-answer","seq":63,"t_ns":2128336165,"type":"decode.layer","step":4,"layer":5,"ms":1.287,"norm":10.895}
+{"v":1,"req":"fixture-short-answer","seq":64,"t_ns":2129397382,"type":"decode.layer","step":4,"layer":6,"ms":1.061,"norm":11.695}
+{"v":1,"req":"fixture-short-answer","seq":65,"t_ns":2131120921,"type":"decode.layer","step":4,"layer":7,"ms":1.724,"norm":13.847}
+{"v":1,"req":"fixture-short-answer","seq":66,"t_ns":2131120921,"type":"decode.logits","step":4,"topk":[{"id":679,"text":" your","p":0.99809},{"id":450,"text":"Quant","p":0.00125},{"id":257,"text":" a","p":0.00022},{"id":52,"text":"4","p":0.00014},{"id":673,"text":" valid","p":0.00007},{"id":347,"text":" lo","p":0.00005},{"id":653,"text":" reads","p":0.00004},{"id":82,"text":"R","p":0.00002},{"id":124,"text":"|","p":0.00002},{"id":209,"text":"�","p":0.00001}],"entropy":0.017}
+{"v":1,"req":"fixture-short-answer","seq":67,"t_ns":2132312025,"type":"decode.sample","step":4,"chosen_id":679,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":68,"t_ns":2132857577,"type":"decode.token","step":4,"text":" your","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":69,"t_ns":2132857577,"type":"decode.step.start","step":5,"kv_used":59,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":70,"t_ns":2134732023,"type":"decode.layer","step":5,"layer":0,"ms":1.824,"norm":5.492}
+{"v":1,"req":"fixture-short-answer","seq":71,"t_ns":2136680355,"type":"decode.layer","step":5,"layer":1,"ms":1.948,"norm":7.016}
+{"v":1,"req":"fixture-short-answer","seq":72,"t_ns":2137992450,"type":"decode.layer","step":5,"layer":2,"ms":1.312,"norm":8.143}
+{"v":1,"req":"fixture-short-answer","seq":73,"t_ns":2139059754,"type":"decode.layer","step":5,"layer":3,"ms":1.067,"norm":9.204}
+{"v":1,"req":"fixture-short-answer","seq":74,"t_ns":2140385091,"type":"decode.layer","step":5,"layer":4,"ms":1.325,"norm":10.137}
+{"v":1,"req":"fixture-short-answer","seq":75,"t_ns":2142280776,"type":"decode.layer","step":5,"layer":5,"ms":1.896,"norm":11.132}
+{"v":1,"req":"fixture-short-answer","seq":76,"t_ns":2143452264,"type":"decode.layer","step":5,"layer":6,"ms":1.171,"norm":12.142}
+{"v":1,"req":"fixture-short-answer","seq":77,"t_ns":2144760184,"type":"decode.layer","step":5,"layer":7,"ms":1.308,"norm":14.249}
+{"v":1,"req":"fixture-short-answer","seq":78,"t_ns":2144760184,"type":"decode.logits","step":5,"topk":[{"id":349,"text":" prompt","p":0.9741},{"id":127,"text":"","p":0.01252},{"id":590,"text":" Every","p":0.00601},{"id":440,"text":"During","p":0.00402},{"id":10,"text":"\n","p":0.00061},{"id":430,"text":"-val","p":0.00048},{"id":86,"text":"V","p":0.00021},{"id":114,"text":"r","p":0.00019},{"id":196,"text":"�","p":0.00017},{"id":631,"text":" like","p":0.00016}],"entropy":0.163}
+{"v":1,"req":"fixture-short-answer","seq":79,"t_ns":2146189165,"type":"decode.sample","step":5,"chosen_id":349,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":80,"t_ns":2146853655,"type":"decode.token","step":5,"text":" prompt","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":81,"t_ns":2146853655,"type":"decode.step.start","step":6,"kv_used":60,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":82,"t_ns":2148988823,"type":"decode.layer","step":6,"layer":0,"ms":2.085,"norm":5.416}
+{"v":1,"req":"fixture-short-answer","seq":83,"t_ns":2150301991,"type":"decode.layer","step":6,"layer":1,"ms":1.313,"norm":6.663}
+{"v":1,"req":"fixture-short-answer","seq":84,"t_ns":2150934297,"type":"decode.layer","step":6,"layer":2,"ms":0.632,"norm":7.554}
+{"v":1,"req":"fixture-short-answer","seq":85,"t_ns":2152592942,"type":"decode.layer","step":6,"layer":3,"ms":1.659,"norm":8.973}
+{"v":1,"req":"fixture-short-answer","seq":86,"t_ns":2153822628,"type":"decode.layer","step":6,"layer":4,"ms":1.23,"norm":10.059}
+{"v":1,"req":"fixture-short-answer","seq":87,"t_ns":2155228579,"type":"decode.layer","step":6,"layer":5,"ms":1.406,"norm":10.89}
+{"v":1,"req":"fixture-short-answer","seq":88,"t_ns":2156523909,"type":"decode.layer","step":6,"layer":6,"ms":1.295,"norm":11.569}
+{"v":1,"req":"fixture-short-answer","seq":89,"t_ns":2157894053,"type":"decode.layer","step":6,"layer":7,"ms":1.37,"norm":14.389}
+{"v":1,"req":"fixture-short-answer","seq":90,"t_ns":2157894053,"type":"decode.logits","step":6,"topk":[{"id":317,"text":" as","p":0.99664},{"id":269,"text":" p","p":0.00089},{"id":242,"text":"�","p":0.00071},{"id":576,"text":" Caching","p":0.00047},{"id":407,"text":" language","p":0.00029},{"id":648,"text":" parallel","p":0.00022},{"id":444,"text":"First","p":0.00017},{"id":468,"text":"ads","p":0.00011},{"id":275,"text":"de","p":0.00011},{"id":210,"text":"�","p":0.00007}],"entropy":0.03}
+{"v":1,"req":"fixture-short-answer","seq":91,"t_ns":2159148463,"type":"decode.sample","step":6,"chosen_id":317,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":92,"t_ns":2159725668,"type":"decode.token","step":6,"text":" as","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":93,"t_ns":2159725668,"type":"decode.step.start","step":7,"kv_used":61,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":94,"t_ns":2162108885,"type":"decode.layer","step":7,"layer":0,"ms":2.333,"norm":6.285}
+{"v":1,"req":"fixture-short-answer","seq":95,"t_ns":2162943537,"type":"decode.layer","step":7,"layer":1,"ms":0.835,"norm":7.175}
+{"v":1,"req":"fixture-short-answer","seq":96,"t_ns":2164615146,"type":"decode.layer","step":7,"layer":2,"ms":1.672,"norm":8.242}
+{"v":1,"req":"fixture-short-answer","seq":97,"t_ns":2165966146,"type":"decode.layer","step":7,"layer":3,"ms":1.351,"norm":8.829}
+{"v":1,"req":"fixture-short-answer","seq":98,"t_ns":2167428159,"type":"decode.layer","step":7,"layer":4,"ms":1.462,"norm":9.645}
+{"v":1,"req":"fixture-short-answer","seq":99,"t_ns":2168279832,"type":"decode.layer","step":7,"layer":5,"ms":0.852,"norm":10.801}
+{"v":1,"req":"fixture-short-answer","seq":100,"t_ns":2169246615,"type":"decode.layer","step":7,"layer":6,"ms":0.967,"norm":12.891}
+{"v":1,"req":"fixture-short-answer","seq":101,"t_ns":2170874255,"type":"decode.layer","step":7,"layer":7,"ms":1.628,"norm":14.059}
+{"v":1,"req":"fixture-short-answer","seq":102,"t_ns":2170874255,"type":"decode.logits","step":7,"topk":[{"id":257,"text":" a","p":0.98976},{"id":38,"text":"&","p":0.0056},{"id":22,"text":"\u0016","p":0.00136},{"id":673,"text":" valid","p":0.00127},{"id":67,"text":"C","p":0.00036},{"id":477,"text":"ampler","p":0.00027},{"id":669,"text":" text","p":0.00018},{"id":549,"text":"omputes","p":0.00017},{"id":106,"text":"j","p":0.00016},{"id":311,"text":"ion","p":0.00014}],"entropy":0.075}
+{"v":1,"req":"fixture-short-answer","seq":103,"t_ns":2172065792,"type":"decode.sample","step":7,"chosen_id":257,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":104,"t_ns":2172611560,"type":"decode.token","step":7,"text":" a","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":105,"t_ns":2172611560,"type":"decode.step.start","step":8,"kv_used":62,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":106,"t_ns":2174839483,"type":"decode.layer","step":8,"layer":0,"ms":2.178,"norm":6.198}
+{"v":1,"req":"fixture-short-answer","seq":107,"t_ns":2176206083,"type":"decode.layer","step":8,"layer":1,"ms":1.367,"norm":6.472}
+{"v":1,"req":"fixture-short-answer","seq":108,"t_ns":2177671902,"type":"decode.layer","step":8,"layer":2,"ms":1.466,"norm":8.175}
+{"v":1,"req":"fixture-short-answer","seq":109,"t_ns":2178846424,"type":"decode.layer","step":8,"layer":3,"ms":1.175,"norm":9.15}
+{"v":1,"req":"fixture-short-answer","seq":110,"t_ns":2180433339,"type":"decode.layer","step":8,"layer":4,"ms":1.587,"norm":10.101}
+{"v":1,"req":"fixture-short-answer","seq":111,"t_ns":2181512117,"type":"decode.layer","step":8,"layer":5,"ms":1.079,"norm":11.097}
+{"v":1,"req":"fixture-short-answer","seq":112,"t_ns":2183100099,"type":"decode.layer","step":8,"layer":6,"ms":1.588,"norm":12.279}
+{"v":1,"req":"fixture-short-answer","seq":113,"t_ns":2184377075,"type":"decode.layer","step":8,"layer":7,"ms":1.277,"norm":13.841}
+{"v":1,"req":"fixture-short-answer","seq":114,"t_ns":2184377075,"type":"decode.logits","step":8,"topk":[{"id":658,"text":" sequence","p":0.9997},{"id":425,"text":"-f","p":0.0002},{"id":454,"text":"UTF","p":0.00002},{"id":151,"text":"�","p":0.00002},{"id":310,"text":"id","p":0},{"id":648,"text":" parallel","p":0},{"id":343,"text":" att","p":0},{"id":635,"text":" lot","p":0},{"id":540,"text":"marize","p":0},{"id":96,"text":"`","p":0}],"entropy":0.003}
+{"v":1,"req":"fixture-short-answer","seq":115,"t_ns":2185523926,"type":"decode.sample","step":8,"chosen_id":658,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":116,"t_ns":2186047352,"type":"decode.token","step":8,"text":" sequence","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":117,"t_ns":2186047352,"type":"decode.step.start","step":9,"kv_used":63,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":118,"t_ns":2187219509,"type":"decode.layer","step":9,"layer":0,"ms":1.122,"norm":5.9}
+{"v":1,"req":"fixture-short-answer","seq":119,"t_ns":2188278651,"type":"decode.layer","step":9,"layer":1,"ms":1.059,"norm":6.531}
+{"v":1,"req":"fixture-short-answer","seq":120,"t_ns":2189738300,"type":"decode.layer","step":9,"layer":2,"ms":1.46,"norm":7.246}
+{"v":1,"req":"fixture-short-answer","seq":121,"t_ns":2190888662,"type":"decode.layer","step":9,"layer":3,"ms":1.15,"norm":8.621}
+{"v":1,"req":"fixture-short-answer","seq":122,"t_ns":2192000020,"type":"decode.layer","step":9,"layer":4,"ms":1.111,"norm":9.404}
+{"v":1,"req":"fixture-short-answer","seq":123,"t_ns":2193145466,"type":"decode.layer","step":9,"layer":5,"ms":1.145,"norm":11.282}
+{"v":1,"req":"fixture-short-answer","seq":124,"t_ns":2194200485,"type":"decode.layer","step":9,"layer":6,"ms":1.055,"norm":11.899}
+{"v":1,"req":"fixture-short-answer","seq":125,"t_ns":2195273049,"type":"decode.layer","step":9,"layer":7,"ms":1.073,"norm":13.807}
+{"v":1,"req":"fixture-short-answer","seq":126,"t_ns":2195273049,"type":"decode.logits","step":9,"topk":[{"id":314,"text":" of","p":0.99051},{"id":671,"text":" turned","p":0.00238},{"id":665,"text":" state","p":0.00188},{"id":562,"text":"rite","p":0.0013},{"id":386,"text":"tes","p":0.00089},{"id":653,"text":" reads","p":0.00061},{"id":607,"text":" blue","p":0.0005},{"id":50,"text":"2","p":0.00037},{"id":638,"text":" means","p":0.0002},{"id":657,"text":" sends","p":0.00018}],"entropy":0.076}
+{"v":1,"req":"fixture-short-answer","seq":127,"t_ns":2196404783,"type":"decode.sample","step":9,"chosen_id":314,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":128,"t_ns":2196920650,"type":"decode.token","step":9,"text":" of","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":129,"t_ns":2196920650,"type":"decode.step.start","step":10,"kv_used":64,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":130,"t_ns":2198193007,"type":"decode.layer","step":10,"layer":0,"ms":1.222,"norm":5.228}
+{"v":1,"req":"fixture-short-answer","seq":131,"t_ns":2199486471,"type":"decode.layer","step":10,"layer":1,"ms":1.293,"norm":5.999}
+{"v":1,"req":"fixture-short-answer","seq":132,"t_ns":2200528860,"type":"decode.layer","step":10,"layer":2,"ms":1.042,"norm":7.314}
+{"v":1,"req":"fixture-short-answer","seq":133,"t_ns":2201541456,"type":"decode.layer","step":10,"layer":3,"ms":1.013,"norm":9.495}
+{"v":1,"req":"fixture-short-answer","seq":134,"t_ns":2202508915,"type":"decode.layer","step":10,"layer":4,"ms":0.967,"norm":10.217}
+{"v":1,"req":"fixture-short-answer","seq":135,"t_ns":2203353793,"type":"decode.layer","step":10,"layer":5,"ms":0.845,"norm":11.441}
+{"v":1,"req":"fixture-short-answer","seq":136,"t_ns":2204719762,"type":"decode.layer","step":10,"layer":6,"ms":1.366,"norm":12.731}
+{"v":1,"req":"fixture-short-answer","seq":137,"t_ns":2206848364,"type":"decode.layer","step":10,"layer":7,"ms":2.129,"norm":14.391}
+{"v":1,"req":"fixture-short-answer","seq":138,"t_ns":2206848364,"type":"decode.logits","step":10,"topk":[{"id":422,"text":" tokens","p":0.98886},{"id":450,"text":"Quant","p":0.0049},{"id":163,"text":"�","p":0.00181},{"id":305,"text":" pro","p":0.00103},{"id":51,"text":"3","p":0.00096},{"id":382,"text":"ld","p":0.0003},{"id":408,"text":" layer","p":0.00027},{"id":9,"text":"\t","p":0.00026},{"id":508,"text":"eight","p":0.00024},{"id":449,"text":"Quan","p":0.00016}],"entropy":0.084}
+{"v":1,"req":"fixture-short-answer","seq":139,"t_ns":2207962501,"type":"decode.sample","step":10,"chosen_id":422,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":140,"t_ns":2208469570,"type":"decode.token","step":10,"text":" tokens","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":141,"t_ns":2208469570,"type":"decode.step.start","step":11,"kv_used":65,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":142,"t_ns":2209830172,"type":"decode.layer","step":11,"layer":0,"ms":1.311,"norm":5.527}
+{"v":1,"req":"fixture-short-answer","seq":143,"t_ns":2211780470,"type":"decode.layer","step":11,"layer":1,"ms":1.95,"norm":6.362}
+{"v":1,"req":"fixture-short-answer","seq":144,"t_ns":2212763357,"type":"decode.layer","step":11,"layer":2,"ms":0.983,"norm":7.566}
+{"v":1,"req":"fixture-short-answer","seq":145,"t_ns":2213999251,"type":"decode.layer","step":11,"layer":3,"ms":1.236,"norm":8.429}
+{"v":1,"req":"fixture-short-answer","seq":146,"t_ns":2215051601,"type":"decode.layer","step":11,"layer":4,"ms":1.052,"norm":9.219}
+{"v":1,"req":"fixture-short-answer","seq":147,"t_ns":2216751246,"type":"decode.layer","step":11,"layer":5,"ms":1.7,"norm":10.441}
+{"v":1,"req":"fixture-short-answer","seq":148,"t_ns":2217754378,"type":"decode.layer","step":11,"layer":6,"ms":1.003,"norm":11.414}
+{"v":1,"req":"fixture-short-answer","seq":149,"t_ns":2219135235,"type":"decode.layer","step":11,"layer":7,"ms":1.381,"norm":13.673}
+{"v":1,"req":"fixture-short-answer","seq":150,"t_ns":2219135235,"type":"decode.logits","step":11,"topk":[{"id":46,"text":".","p":0.99525},{"id":22,"text":"\u0016","p":0.00354},{"id":142,"text":"�","p":0.00039},{"id":406,"text":" have","p":0.00025},{"id":318,"text":" be","p":0.00015},{"id":614,"text":" could","p":0.0001},{"id":15,"text":"\u000f","p":0.00009},{"id":45,"text":"-","p":0.00005},{"id":254,"text":"�","p":0.00003},{"id":145,"text":"�","p":0.00002}],"entropy":0.035}
+{"v":1,"req":"fixture-short-answer","seq":151,"t_ns":2220270934,"type":"decode.sample","step":11,"chosen_id":46,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":152,"t_ns":2220788784,"type":"decode.token","step":11,"text":".","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":153,"t_ns":2220788784,"type":"decode.step.start","step":12,"kv_used":66,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":154,"t_ns":2222454673,"type":"decode.layer","step":12,"layer":0,"ms":1.616,"norm":5.966}
+{"v":1,"req":"fixture-short-answer","seq":155,"t_ns":2224161514,"type":"decode.layer","step":12,"layer":1,"ms":1.707,"norm":7.14}
+{"v":1,"req":"fixture-short-answer","seq":156,"t_ns":2225084167,"type":"decode.layer","step":12,"layer":2,"ms":0.923,"norm":7.995}
+{"v":1,"req":"fixture-short-answer","seq":157,"t_ns":2226327631,"type":"decode.layer","step":12,"layer":3,"ms":1.243,"norm":8.653}
+{"v":1,"req":"fixture-short-answer","seq":158,"t_ns":2227285848,"type":"decode.layer","step":12,"layer":4,"ms":0.958,"norm":9.938}
+{"v":1,"req":"fixture-short-answer","seq":159,"t_ns":2228134062,"type":"decode.layer","step":12,"layer":5,"ms":0.848,"norm":11.129}
+{"v":1,"req":"fixture-short-answer","seq":160,"t_ns":2229552960,"type":"decode.layer","step":12,"layer":6,"ms":1.419,"norm":12.756}
+{"v":1,"req":"fixture-short-answer","seq":161,"t_ns":2231320320,"type":"decode.layer","step":12,"layer":7,"ms":1.767,"norm":13.943}
+{"v":1,"req":"fixture-short-answer","seq":162,"t_ns":2231320320,"type":"decode.logits","step":12,"topk":[{"id":578,"text":" First","p":0.35584},{"id":485,"text":"ats","p":0.33645},{"id":241,"text":"�","p":0.27713},{"id":286,"text":" token","p":0.00648},{"id":166,"text":"�","p":0.0038},{"id":423,"text":" with","p":0.0029},{"id":427,"text":"-of","p":0.00284},{"id":240,"text":"�","p":0.00202},{"id":346,"text":" into","p":0.00192},{"id":229,"text":"�","p":0.00155}],"entropy":1.283}
+{"v":1,"req":"fixture-short-answer","seq":163,"t_ns":2232550420,"type":"decode.sample","step":12,"chosen_id":578,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":164,"t_ns":2233115470,"type":"decode.token","step":12,"text":" First","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":165,"t_ns":2233115470,"type":"decode.step.start","step":13,"kv_used":67,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":166,"t_ns":2235121287,"type":"decode.layer","step":13,"layer":0,"ms":1.956,"norm":5.639}
+{"v":1,"req":"fixture-short-answer","seq":167,"t_ns":2236389470,"type":"decode.layer","step":13,"layer":1,"ms":1.268,"norm":6.668}
+{"v":1,"req":"fixture-short-answer","seq":168,"t_ns":2237871111,"type":"decode.layer","step":13,"layer":2,"ms":1.482,"norm":7.504}
+{"v":1,"req":"fixture-short-answer","seq":169,"t_ns":2239239877,"type":"decode.layer","step":13,"layer":3,"ms":1.369,"norm":8.498}
+{"v":1,"req":"fixture-short-answer","seq":170,"t_ns":2240881429,"type":"decode.layer","step":13,"layer":4,"ms":1.642,"norm":9.382}
+{"v":1,"req":"fixture-short-answer","seq":171,"t_ns":2242634134,"type":"decode.layer","step":13,"layer":5,"ms":1.753,"norm":10.568}
+{"v":1,"req":"fixture-short-answer","seq":172,"t_ns":2244054779,"type":"decode.layer","step":13,"layer":6,"ms":1.421,"norm":11.93}
+{"v":1,"req":"fixture-short-answer","seq":173,"t_ns":2246614760,"type":"decode.layer","step":13,"layer":7,"ms":2.56,"norm":14.031}
+{"v":1,"req":"fixture-short-answer","seq":174,"t_ns":2246614760,"type":"decode.logits","step":13,"topk":[{"id":263,"text":" the","p":0.99036},{"id":241,"text":"�","p":0.00388},{"id":596,"text":" Then","p":0.00152},{"id":455,"text":"ab","p":0.0012},{"id":334,"text":"val","p":0.00076},{"id":243,"text":"�","p":0.00059},{"id":170,"text":"�","p":0.00045},{"id":4,"text":"\u0004","p":0.00014},{"id":202,"text":"�","p":0.00014},{"id":229,"text":"�","p":0.00013}],"entropy":0.075}
+{"v":1,"req":"fixture-short-answer","seq":175,"t_ns":2247941097,"type":"decode.sample","step":13,"chosen_id":263,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":176,"t_ns":2248554265,"type":"decode.token","step":13,"text":" the","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":177,"t_ns":2248554265,"type":"decode.step.start","step":14,"kv_used":68,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":178,"t_ns":2250052989,"type":"decode.layer","step":14,"layer":0,"ms":1.449,"norm":6.553}
+{"v":1,"req":"fixture-short-answer","seq":179,"t_ns":2251060378,"type":"decode.layer","step":14,"layer":1,"ms":1.007,"norm":7.577}
+{"v":1,"req":"fixture-short-answer","seq":180,"t_ns":2252027885,"type":"decode.layer","step":14,"layer":2,"ms":0.968,"norm":9.218}
+{"v":1,"req":"fixture-short-answer","seq":181,"t_ns":2253499638,"type":"decode.layer","step":14,"layer":3,"ms":1.472,"norm":10.46}
+{"v":1,"req":"fixture-short-answer","seq":182,"t_ns":2254844343,"type":"decode.layer","step":14,"layer":4,"ms":1.345,"norm":11.223}
+{"v":1,"req":"fixture-short-answer","seq":183,"t_ns":2255687254,"type":"decode.layer","step":14,"layer":5,"ms":0.843,"norm":12.526}
+{"v":1,"req":"fixture-short-answer","seq":184,"t_ns":2256927032,"type":"decode.layer","step":14,"layer":6,"ms":1.24,"norm":13.815}
+{"v":1,"req":"fixture-short-answer","seq":185,"t_ns":2258204381,"type":"decode.layer","step":14,"layer":7,"ms":1.277,"norm":15.819}
+{"v":1,"req":"fixture-short-answer","seq":186,"t_ns":2258204381,"type":"decode.logits","step":14,"topk":[{"id":669,"text":" text","p":0.99243},{"id":480,"text":"arg","p":0.00137},{"id":578,"text":" First","p":0.00106},{"id":182,"text":"�","p":0.00093},{"id":40,"text":"(","p":0.00069},{"id":563,"text":"rade","p":0.0004},{"id":662,"text":" stops","p":0.00031},{"id":613,"text":" computes","p":0.00025},{"id":262,"text":"it","p":0.00021},{"id":482,"text":"ariz","p":0.00019}],"entropy":0.067}
+{"v":1,"req":"fixture-short-answer","seq":187,"t_ns":2259297745,"type":"decode.sample","step":14,"chosen_id":669,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":188,"t_ns":2259794427,"type":"decode.token","step":14,"text":" text","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":189,"t_ns":2259794427,"type":"decode.step.start","step":15,"kv_used":69,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":190,"t_ns":2261682959,"type":"decode.layer","step":15,"layer":0,"ms":1.839,"norm":5.538}
+{"v":1,"req":"fixture-short-answer","seq":191,"t_ns":2262675982,"type":"decode.layer","step":15,"layer":1,"ms":0.993,"norm":6.834}
+{"v":1,"req":"fixture-short-answer","seq":192,"t_ns":2264167538,"type":"decode.layer","step":15,"layer":2,"ms":1.492,"norm":7.549}
+{"v":1,"req":"fixture-short-answer","seq":193,"t_ns":2265684966,"type":"decode.layer","step":15,"layer":3,"ms":1.517,"norm":8.488}
+{"v":1,"req":"fixture-short-answer","seq":194,"t_ns":2266880095,"type":"decode.layer","step":15,"layer":4,"ms":1.195,"norm":9.215}
+{"v":1,"req":"fixture-short-answer","seq":195,"t_ns":2268594160,"type":"decode.layer","step":15,"layer":5,"ms":1.714,"norm":10.389}
+{"v":1,"req":"fixture-short-answer","seq":196,"t_ns":2269554132,"type":"decode.layer","step":15,"layer":6,"ms":0.96,"norm":10.992}
+{"v":1,"req":"fixture-short-answer","seq":197,"t_ns":2271527252,"type":"decode.layer","step":15,"layer":7,"ms":1.973,"norm":13.939}
+{"v":1,"req":"fixture-short-answer","seq":198,"t_ns":2271527252,"type":"decode.logits","step":15,"topk":[{"id":302,"text":" is","p":0.99793},{"id":629,"text":" longer","p":0.00091},{"id":564,"text":"reaming","p":0.00021},{"id":277,"text":"tep","p":0.00021},{"id":77,"text":"M","p":0.00015},{"id":487,"text":"babilities","p":0.00011},{"id":586,"text":" id","p":0.0001},{"id":615,"text":" confident","p":0.00006},{"id":262,"text":"it","p":0.00005},{"id":256,"text":" t","p":0.00005}],"entropy":0.019}
+{"v":1,"req":"fixture-short-answer","seq":199,"t_ns":2272798964,"type":"decode.sample","step":15,"chosen_id":302,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":200,"t_ns":2273384819,"type":"decode.token","step":15,"text":" is","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":201,"t_ns":2273384819,"type":"decode.step.start","step":16,"kv_used":70,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":202,"t_ns":2275271415,"type":"decode.layer","step":16,"layer":0,"ms":1.837,"norm":5.417}
+{"v":1,"req":"fixture-short-answer","seq":203,"t_ns":2276536633,"type":"decode.layer","step":16,"layer":1,"ms":1.265,"norm":7.203}
+{"v":1,"req":"fixture-short-answer","seq":204,"t_ns":2278182592,"type":"decode.layer","step":16,"layer":2,"ms":1.646,"norm":8.462}
+{"v":1,"req":"fixture-short-answer","seq":205,"t_ns":2279720736,"type":"decode.layer","step":16,"layer":3,"ms":1.538,"norm":9.773}
+{"v":1,"req":"fixture-short-answer","seq":206,"t_ns":2281067361,"type":"decode.layer","step":16,"layer":4,"ms":1.347,"norm":11.333}
+{"v":1,"req":"fixture-short-answer","seq":207,"t_ns":2282227843,"type":"decode.layer","step":16,"layer":5,"ms":1.16,"norm":12.957}
+{"v":1,"req":"fixture-short-answer","seq":208,"t_ns":2283785119,"type":"decode.layer","step":16,"layer":6,"ms":1.557,"norm":14.75}
+{"v":1,"req":"fixture-short-answer","seq":209,"t_ns":2285601736,"type":"decode.layer","step":16,"layer":7,"ms":1.817,"norm":16.649}
+{"v":1,"req":"fixture-short-answer","seq":210,"t_ns":2285601736,"type":"decode.logits","step":16,"topk":[{"id":661,"text":" split","p":0.31052},{"id":255,"text":"�","p":0.24183},{"id":635,"text":" lot","p":0.16708},{"id":289,"text":"mp","p":0.03124},{"id":325,"text":"il","p":0.0291},{"id":588,"text":" or","p":0.02856},{"id":262,"text":"it","p":0.02008},{"id":478,"text":"ans","p":0.01958},{"id":182,"text":"�","p":0.01597},{"id":475,"text":"aming","p":0.01497}],"entropy":2.227}
+{"v":1,"req":"fixture-short-answer","seq":211,"t_ns":2286937260,"type":"decode.sample","step":16,"chosen_id":661,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":212,"t_ns":2287555022,"type":"decode.token","step":16,"text":" split","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":213,"t_ns":2287555022,"type":"decode.step.start","step":17,"kv_used":71,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":214,"t_ns":2289476215,"type":"decode.layer","step":17,"layer":0,"ms":1.871,"norm":5.594}
+{"v":1,"req":"fixture-short-answer","seq":215,"t_ns":2290974427,"type":"decode.layer","step":17,"layer":1,"ms":1.498,"norm":6.371}
+{"v":1,"req":"fixture-short-answer","seq":216,"t_ns":2292259397,"type":"decode.layer","step":17,"layer":2,"ms":1.285,"norm":7.428}
+{"v":1,"req":"fixture-short-answer","seq":217,"t_ns":2293619733,"type":"decode.layer","step":17,"layer":3,"ms":1.36,"norm":8.641}
+{"v":1,"req":"fixture-short-answer","seq":218,"t_ns":2295036073,"type":"decode.layer","step":17,"layer":4,"ms":1.416,"norm":9.388}
+{"v":1,"req":"fixture-short-answer","seq":219,"t_ns":2296182720,"type":"decode.layer","step":17,"layer":5,"ms":1.147,"norm":10.353}
+{"v":1,"req":"fixture-short-answer","seq":220,"t_ns":2297956952,"type":"decode.layer","step":17,"layer":6,"ms":1.774,"norm":10.648}
+{"v":1,"req":"fixture-short-answer","seq":221,"t_ns":2299863305,"type":"decode.layer","step":17,"layer":7,"ms":1.906,"norm":11.497}
+{"v":1,"req":"fixture-short-answer","seq":222,"t_ns":2299863305,"type":"decode.logits","step":17,"topk":[{"id":346,"text":" into","p":0.99911},{"id":580,"text":" Quantized","p":0.00019},{"id":16,"text":"\u0010","p":0.00014},{"id":339,"text":" W","p":0.00014},{"id":424,"text":" A","p":0.00012},{"id":583,"text":" drawing","p":0.00007},{"id":124,"text":"|","p":0.00005},{"id":38,"text":"&","p":0.00004},{"id":131,"text":"�","p":0.00004},{"id":366,"text":"ention","p":0.00002}],"entropy":0.009}
+{"v":1,"req":"fixture-short-answer","seq":223,"t_ns":2301043565,"type":"decode.sample","step":17,"chosen_id":346,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":224,"t_ns":2301583695,"type":"decode.token","step":17,"text":" into","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":225,"t_ns":2301583695,"type":"decode.step.start","step":18,"kv_used":72,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":226,"t_ns":2303619348,"type":"decode.layer","step":18,"layer":0,"ms":1.986,"norm":5.622}
+{"v":1,"req":"fixture-short-answer","seq":227,"t_ns":2305226901,"type":"decode.layer","step":18,"layer":1,"ms":1.608,"norm":6.896}
+{"v":1,"req":"fixture-short-answer","seq":228,"t_ns":2306641358,"type":"decode.layer","step":18,"layer":2,"ms":1.414,"norm":7.979}
+{"v":1,"req":"fixture-short-answer","seq":229,"t_ns":2307883236,"type":"decode.layer","step":18,"layer":3,"ms":1.242,"norm":8.583}
+{"v":1,"req":"fixture-short-answer","seq":230,"t_ns":2309064555,"type":"decode.layer","step":18,"layer":4,"ms":1.181,"norm":10.109}
+{"v":1,"req":"fixture-short-answer","seq":231,"t_ns":2310537683,"type":"decode.layer","step":18,"layer":5,"ms":1.473,"norm":11.028}
+{"v":1,"req":"fixture-short-answer","seq":232,"t_ns":2311148755,"type":"decode.layer","step":18,"layer":6,"ms":0.611,"norm":12.387}
+{"v":1,"req":"fixture-short-answer","seq":233,"t_ns":2312350185,"type":"decode.layer","step":18,"layer":7,"ms":1.201,"norm":14.865}
+{"v":1,"req":"fixture-short-answer","seq":234,"t_ns":2312350185,"type":"decode.logits","step":18,"topk":[{"id":649,"text":" pieces","p":0.99579},{"id":558,"text":"ps","p":0.00082},{"id":542,"text":"mits","p":0.00063},{"id":53,"text":"5","p":0.00054},{"id":146,"text":"�","p":0.00036},{"id":165,"text":"�","p":0.00036},{"id":519,"text":"fines","p":0.00019},{"id":497,"text":"com","p":0.00017},{"id":39,"text":"'","p":0.00014},{"id":388,"text":"urn","p":0.00012}],"entropy":0.039}
+{"v":1,"req":"fixture-short-answer","seq":235,"t_ns":2313496867,"type":"decode.sample","step":18,"chosen_id":649,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":236,"t_ns":2314020208,"type":"decode.token","step":18,"text":" pieces","is_eos":false}
+{"v":1,"req":"fixture-short-answer","seq":237,"t_ns":2314020208,"type":"decode.step.start","step":19,"kv_used":73,"kv_total":4096}
+{"v":1,"req":"fixture-short-answer","seq":238,"t_ns":2315933121,"type":"decode.layer","step":19,"layer":0,"ms":1.863,"norm":5.941}
+{"v":1,"req":"fixture-short-answer","seq":239,"t_ns":2317105635,"type":"decode.layer","step":19,"layer":1,"ms":1.173,"norm":7.484}
+{"v":1,"req":"fixture-short-answer","seq":240,"t_ns":2318522668,"type":"decode.layer","step":19,"layer":2,"ms":1.417,"norm":9.04}
+{"v":1,"req":"fixture-short-answer","seq":241,"t_ns":2320307296,"type":"decode.layer","step":19,"layer":3,"ms":1.785,"norm":9.703}
+{"v":1,"req":"fixture-short-answer","seq":242,"t_ns":2321893364,"type":"decode.layer","step":19,"layer":4,"ms":1.586,"norm":10.452}
+{"v":1,"req":"fixture-short-answer","seq":243,"t_ns":2322778658,"type":"decode.layer","step":19,"layer":5,"ms":0.885,"norm":11.584}
+{"v":1,"req":"fixture-short-answer","seq":244,"t_ns":2324037226,"type":"decode.layer","step":19,"layer":6,"ms":1.259,"norm":12.691}
+{"v":1,"req":"fixture-short-answer","seq":245,"t_ns":2325353170,"type":"decode.layer","step":19,"layer":7,"ms":1.316,"norm":15.005}
+{"v":1,"req":"fixture-short-answer","seq":246,"t_ns":2325353170,"type":"decode.logits","step":19,"topk":[{"id":261,"text":"in","p":0.18877},{"id":689,"text":"<|eot|>","p":0.10454},{"id":586,"text":" id","p":0.10151},{"id":7,"text":"\u0007","p":0.09846},{"id":551,"text":"onger","p":0.09519},{"id":355,"text":"ache","p":0.08142},{"id":540,"text":"marize","p":0.07242},{"id":201,"text":"�","p":0.06519},{"id":623,"text":" high","p":0.04309},{"id":176,"text":"�","p":0.03584}],"entropy":2.626}
+{"v":1,"req":"fixture-short-answer","seq":247,"t_ns":2326539962,"type":"decode.sample","step":19,"chosen_id":689,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}
+{"v":1,"req":"fixture-short-answer","seq":248,"t_ns":2327083357,"type":"decode.token","step":19,"text":"","is_eos":true}
+{"v":1,"req":"fixture-short-answer","seq":249,"t_ns":2327583357,"type":"request.done","stats":{"prompt_eval_count":54,"prompt_eval_ms":268.333,"eval_count":20,"eval_ms":256.45,"load_ms":800.3,"total_ms":1327.583}}

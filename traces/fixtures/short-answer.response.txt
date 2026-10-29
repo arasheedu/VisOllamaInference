@@ -1,0 +1,1 @@
+A language model reads your prompt as a sequence of tokens. First the text is split into pieces
