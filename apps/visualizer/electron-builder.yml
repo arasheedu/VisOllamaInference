@@ -1,0 +1,26 @@
+appId: dev.llm-inference-visualizer
+productName: LLM Inference Visualizer
+directories:
+  output: release/${version}
+  buildResources: build
+# Everything (renderer, main, preload, ws) is bundled by electron-vite.
+files:
+  - out/**/*
+  - package.json
+asar: true
+npmRebuild: false
+win:
+  target: [nsis, zip]
+  artifactName: ${productName}-${version}-win-${arch}.${ext}
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+mac:
+  target: [dmg, zip]
+  category: public.app-category.developer-tools
+  artifactName: ${productName}-${version}-mac-${arch}.${ext}
+linux:
+  target: [AppImage, deb]
+  category: Development
+  artifactName: ${productName}-${version}-linux-${arch}.${ext}
+publish: null

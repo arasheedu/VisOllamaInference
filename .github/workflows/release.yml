@@ -1,0 +1,45 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - name: Package
+        run: pnpm --filter visualizer package
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: visualizer-${{ matrix.os }}
+          path: |
+            apps/visualizer/release/*/*.exe
+            apps/visualizer/release/*/*.zip
+            apps/visualizer/release/*/*.dmg
+            apps/visualizer/release/*/*.AppImage
+            apps/visualizer/release/*/*.deb
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apps/visualizer/release/*/*.exe
+            apps/visualizer/release/*/*.zip
+            apps/visualizer/release/*/*.dmg
+            apps/visualizer/release/*/*.AppImage
+            apps/visualizer/release/*/*.deb
