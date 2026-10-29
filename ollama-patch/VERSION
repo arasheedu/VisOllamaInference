@@ -1,0 +1,6 @@
+base_tag=v0.40.13
+base_describe=v0.40.13-2-g8861adaa
+base_commit=8861adaa77839c961d3c574232a8865d65a426b6
+branch=visualizer-trace
+llama_cpp=b11963
+go=1.26.10

@@ -1,0 +1,273 @@
+From adde0330b1741eef576ee2603fed2b61ee046281 Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 14:53:48 -0700
+Subject: [PATCH 3/3] server: trace chat and generate requests
+
+Read X-Trace-Request-Id, X-Trace-Detail and X-Trace-Step, attach a tracer
+to the request context and emit request.received, model.load start/done,
+decode.token for the text each response chunk sends to the client
+(thinking + content, after parsers), stream.chunk at full detail and
+request.done/request.error. Allow the X-Trace-* headers through CORS and
+expose X-Trace-Request-Id.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ server/routes.go | 37 +++++++++++++++++++++
+ server/trace.go  | 85 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 122 insertions(+)
+ create mode 100644 server/trace.go
+
+diff --git a/server/routes.go b/server/routes.go
+index 845e220a..6fc8fbc8 100644
+--- a/server/routes.go
++++ b/server/routes.go
+@@ -25,6 +25,7 @@ import (
+ 	"sync/atomic"
+ 	"syscall"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	"github.com/gin-contrib/cors"
+ 	"github.com/gin-gonic/gin"
+@@ -49,6 +50,7 @@ import (
+ 	"github.com/ollama/ollama/template"
+ 	thinkingparser "github.com/ollama/ollama/thinking"
+ 	"github.com/ollama/ollama/tools"
++	"github.com/ollama/ollama/trace"
+ 	"github.com/ollama/ollama/types/errtypes"
+ 	"github.com/ollama/ollama/types/model"
+ 	"github.com/ollama/ollama/version"
+@@ -283,6 +285,11 @@ func (s *Server) scheduleRunnerForModel(ctx context.Context, m *Model, caps []mo
+ 		return nil, nil, nil, err
+ 	}
+ 
++	tr := trace.FromContext(ctx)
++	loadStart := time.Now()
++	layers := int(m.metadata.Int("block_count"))
++	tr.ModelLoadStart(layers, opts.NumCtx)
++
+ 	runnerCh, errCh := s.sched.getRunner(ctx, m, opts, keepAlive, numCtxAuto, numBatchAuto, shift)
+ 	var runner *runnerRef
+ 	select {
+@@ -291,6 +298,11 @@ func (s *Server) scheduleRunnerForModel(ctx context.Context, m *Model, caps []mo
+ 		return nil, nil, nil, err
+ 	}
+ 
++	if tr != nil {
++		_, vram := runner.llama.MemorySize()
++		tr.ModelLoadDone(layers, runner.llama.ContextLength(), float64(vram)/(1<<20), time.Since(loadStart))
++	}
++
+ 	return runner.llama, m, &opts, nil
+ }
+ 
+@@ -320,6 +332,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
+ 		return
+ 	}
+ 
++	tr := startTrace(c)
++	defer endTrace(c, tr)
++	tr.Received(req.Model, utf8.RuneCountInString(req.Prompt), req.Options)
++
+ 	if len(body.Think) > 0 {
+ 		if err := json.Unmarshal(body.Think, &req.Think); err != nil {
+ 			err = s.thinkingInputError(c.Request.Context(), req.Model, err)
+@@ -813,6 +829,8 @@ func (s *Server) GenerateHandler(c *gin.Context) {
+ 				}
+ 			}
+ 
++			traceChunk(c, tr, res.Thinking, res.Response, res.Metrics, res.Done)
++
+ 			if builtinParser != nil {
+ 				// Emit chunks that carry logprobs even if the parser is still buffering
+ 				// visible content, otherwise generate logprobs disappear for models with
+@@ -867,6 +885,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
+ 					status = http.StatusInternalServerError
+ 				}
+ 
++				traceError(c, msg)
+ 				c.JSON(status, gin.H{"error": msg})
+ 				return
+ 			default:
+@@ -2377,7 +2396,13 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
+ 		"x-stainless-runtime",
+ 		"x-stainless-runtime-version",
+ 		"x-stainless-timeout",
++
++		// LLM inference visualizer trace correlation
++		trace.HeaderRequestID,
++		trace.HeaderDetail,
++		trace.HeaderStep,
+ 	}
++	corsConfig.ExposeHeaders = append(corsConfig.ExposeHeaders, trace.HeaderRequestID)
+ 	corsConfig.AllowOrigins = envconfig.AllowedOrigins()
+ 
+ 	r := gin.Default()
+@@ -2472,6 +2497,7 @@ func (s *Server) ModelRecommendationsExperimentalHandler(c *gin.Context) {
+ func Serve(ln net.Listener) error {
+ 	slog.SetDefault(logutil.NewLogger(os.Stderr, envconfig.LogLevel()))
+ 	slog.Info("server config", "env", envconfig.Values())
++	trace.Init()
+ 	cloudDisabled, _ := internalcloud.Status()
+ 	slog.Info(fmt.Sprintf("Ollama cloud disabled: %t", cloudDisabled))
+ 
+@@ -2641,6 +2667,7 @@ func streamResponse(c *gin.Context, ch chan any) {
+ 					status = http.StatusInternalServerError
+ 				}
+ 
++				traceError(c, e)
+ 				if !c.Writer.Written() {
+ 					c.Header("Content-Type", "application/json")
+ 					c.JSON(status, gin.H{"error": e})
+@@ -2993,6 +3020,7 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
+ 					status = http.StatusInternalServerError
+ 				}
+ 
++				traceError(c, msg)
+ 				c.JSON(status, gin.H{"error": msg})
+ 				return
+ 			default:
+@@ -3032,6 +3060,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
+ 		return
+ 	}
+ 
++	tr := startTrace(c)
++	defer endTrace(c, tr)
++	tr.Received(req.Model, chatPromptChars(req.Messages), req.Options)
++
+ 	if len(body.Think) > 0 {
+ 		if err := json.Unmarshal(body.Think, &req.Think); err != nil {
+ 			err = s.thinkingInputError(c.Request.Context(), req.Model, err)
+@@ -3390,6 +3422,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
+ 					toolCalls[i].ID = toolCallId()
+ 				}
+ 				res.Message.ToolCalls = toolCalls
++				traceChatChunk(c, tr, res)
+ 
+ 				if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || r.Done || len(res.Logprobs) > 0 {
+ 					slog.Log(ctx, logutil.LevelTrace, "builtin parser output", "parser", parserName, "content", content, "thinking", thinking, "toolCalls", toolCalls, "done", r.Done)
+@@ -3433,12 +3466,14 @@ func (s *Server) ChatHandler(c *gin.Context) {
+ 
+ 					if r.Done {
+ 						res.Message.Content = toolParser.Content()
++						traceChatChunk(c, tr, res)
+ 						ch <- res
+ 					}
+ 					return
+ 				}
+ 			}
+ 
++			traceChatChunk(c, tr, res)
+ 			ch <- res
+ 		})
+ 		if parserErr != nil {
+@@ -3541,6 +3576,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
+ 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+ 			}
+ 
++			traceChatChunk(c, trace.FromContext(c.Request.Context()), res)
+ 			ch <- res
+ 		})
+ 		if err != nil {
+@@ -3626,6 +3662,7 @@ func countChatImages(msgs []api.Message) int {
+ 
+ func handleScheduleError(c *gin.Context, name string, err error) {
+ 	status, message := scheduleError(name, err)
++	traceError(c, message)
+ 	c.JSON(status, gin.H{"error": message})
+ }
+ 
+diff --git a/server/trace.go b/server/trace.go
+new file mode 100644
+index 00000000..8f062f98
+--- /dev/null
++++ b/server/trace.go
+@@ -0,0 +1,85 @@
++package server
++
++import (
++	"fmt"
++	"time"
++	"unicode/utf8"
++
++	"github.com/gin-gonic/gin"
++
++	"github.com/ollama/ollama/api"
++	"github.com/ollama/ollama/trace"
++)
++
++// startTrace attaches a request tracer to the request context when tracing is
++// enabled (OLLAMA_TRACE_URL). The visualizer correlates its own request with
++// the trace through the X-Trace-Request-Id header, which is echoed back.
++func startTrace(c *gin.Context) *trace.RequestTracer {
++	tr := trace.NewRequest(c.GetHeader(trace.HeaderRequestID), c.GetHeader(trace.HeaderDetail), c.GetHeader(trace.HeaderStep))
++	if tr == nil {
++		return nil
++	}
++	c.Request = c.Request.WithContext(trace.NewContext(c.Request.Context(), tr))
++	c.Header(trace.HeaderRequestID, tr.ID())
++	return tr
++}
++
++// endTrace makes sure every traced request ends with request.done or
++// request.error, including early returns that never reached the model.
++func endTrace(c *gin.Context, tr *trace.RequestTracer) {
++	if tr == nil {
++		return
++	}
++	switch status := c.Writer.Status(); {
++	case c.Request.Context().Err() != nil:
++		tr.End(false, "request canceled")
++	case status >= 400:
++		tr.End(false, fmt.Sprintf("request failed with HTTP status %d", status))
++	default:
++		tr.End(true, "")
++	}
++}
++
++func chatPromptChars(msgs []api.Message) int {
++	n := 0
++	for _, m := range msgs {
++		n += utf8.RuneCountInString(m.Content)
++	}
++	return n
++}
++
++// traceChunk emits decode.token for the text of one response chunk exactly as
++// it is sent to the client (thinking first, then content, matching their
++// order within a chunk), and request.done on the final chunk.
++func traceChunk(c *gin.Context, tr *trace.RequestTracer, thinking, content string, m api.Metrics, done bool) {
++	if tr == nil {
++		return
++	}
++	tr.Token(c.Request.Context(), thinking+content, done)
++	if done {
++		tr.Done(trace.Stats{
++			PromptEvalCount: m.PromptEvalCount,
++			PromptEvalMS:    durMS(m.PromptEvalDuration),
++			EvalCount:       m.EvalCount,
++			EvalMS:          durMS(m.EvalDuration),
++			LoadMS:          durMS(m.LoadDuration),
++			TotalMS:         durMS(m.TotalDuration),
++		})
++	}
++}
++
++func traceChatChunk(c *gin.Context, tr *trace.RequestTracer, res api.ChatResponse) {
++	if tr == nil {
++		return
++	}
++	traceChunk(c, tr, res.Message.Thinking, res.Message.Content, res.Metrics, res.Done)
++}
++
++func traceError(c *gin.Context, msg string) {
++	if c.Request == nil {
++		return
++	}
++	trace.FromContext(c.Request.Context()).Error(msg)
++}
++
++func durMS(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
+-- 
+2.47.1.windows.2
+

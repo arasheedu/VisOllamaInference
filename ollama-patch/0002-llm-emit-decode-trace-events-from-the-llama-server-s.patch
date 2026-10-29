@@ -1,0 +1,436 @@
+From eae879fd74739ac32d77ab85991bfef9627c9cc6 Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 14:53:48 -0700
+Subject: [PATCH 2/3] llm: emit decode trace events from the llama-server
+ stream
+
+When a request carries a tracer, ask llama-server for top-10 probabilities
+and per-token timings, tokenize the exact prompt with /tokenize
+with_pieces (via /apply-template on the native chat path), synthesize one
+prefill batch from prompt_n/prompt_ms and emit decode.step.start,
+decode.logits and decode.sample for every streamed chunk. Probabilities
+requested only for tracing never reach the client.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ llm/llama_server.go            |  48 ++++++-
+ llm/llama_server_trace.go      | 238 +++++++++++++++++++++++++++++++++
+ llm/llama_server_trace_test.go |  47 +++++++
+ 3 files changed, 331 insertions(+), 2 deletions(-)
+ create mode 100644 llm/llama_server_trace.go
+ create mode 100644 llm/llama_server_trace_test.go
+
+diff --git a/llm/llama_server.go b/llm/llama_server.go
+index db6d7431..37ccb6a7 100644
+--- a/llm/llama_server.go
++++ b/llm/llama_server.go
+@@ -1657,6 +1657,7 @@ type llamaServerApplyTemplateResponse struct {
+ }
+ 
+ type llamaServerTokenProb struct {
++	ID          int                    `json:"id"`
+ 	Token       string                 `json:"token"`
+ 	Logprob     float64                `json:"logprob"`
+ 	Prob        float64                `json:"prob"`
+@@ -1719,6 +1720,12 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
+ 		lsReq.NProbs = max(req.TopLogprobs, 1)
+ 	}
+ 
++	td := s.newTraceDecode(ctx, req.Options)
++	if td != nil {
++		lsReq.NProbs = max(lsReq.NProbs, traceTopK)
++		lsReq.TimingsPerToken = true
++	}
++
+ 	// Handle format: pass JSON schema directly to llama-server, or use grammar
+ 	if len(req.Format) > 0 {
+ 		switch string(req.Format) {
+@@ -1775,6 +1782,10 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
+ 		return fmt.Errorf("failed to marshal completion request: %v", err)
+ 	}
+ 
++	if td != nil && len(req.Media) == 0 {
++		td.tokenize(ctx, s, prompt)
++	}
++
+ 	endpoint := fmt.Sprintf("http://127.0.0.1:%d/completion", s.port)
+ 	serverReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, buffer)
+ 	if err != nil {
+@@ -1782,6 +1793,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
+ 	}
+ 	serverReq.Header.Set("Content-Type", "application/json")
+ 
++	td.requestSent()
+ 	res, err := s.httpClient().Do(serverReq)
+ 	if err != nil {
+ 		if errors.Is(err, context.Canceled) {
+@@ -1853,13 +1865,18 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
+ 			}
+ 
+ 			if lsResp.Content != "" && !lsResp.Stop {
++				td.step(ctx, lsResp.Timings, lsResp.CompletionProbabilities, false)
+ 				fn(CompletionResponse{
+ 					Content:  lsResp.Content,
+-					Logprobs: convertLogprobs(lsResp.CompletionProbabilities, req.TopLogprobs > 0),
++					Logprobs: userLogprobs(lsResp.CompletionProbabilities, req.Logprobs, req.TopLogprobs),
+ 				})
+ 			}
+ 
+ 			if lsResp.Stop {
++				if td != nil && (lsResp.Content != "" || lsResp.StopType == "eos") {
++					td.step(ctx, lsResp.Timings, lsResp.CompletionProbabilities, lsResp.StopType == "eos")
++				}
++
+ 				doneReason := DoneReasonStop
+ 				if lsResp.StopType == "limit" {
+ 					doneReason = DoneReasonLength
+@@ -2065,6 +2082,23 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
+ 		return err
+ 	}
+ 
++	td := s.newTraceDecode(ctx, req.Options)
++	if td != nil {
++		topLogprobs, _ := lsReq["top_logprobs"].(int)
++		lsReq["logprobs"] = true
++		lsReq["top_logprobs"] = max(topLogprobs, traceTopK)
++		lsReq["timings_per_token"] = true
++		if !chatRequestHasMedia(req) {
++			// The native path renders the prompt inside llama-server, so ask it
++			// for the same rendering to tokenize.
++			if prompt, err := s.ApplyChatTemplate(ctx, req); err == nil {
++				td.tokenize(ctx, s, prompt)
++			} else {
++				slog.Debug("trace: apply-template failed", "error", err)
++			}
++		}
++	}
++
+ 	buffer := &bytes.Buffer{}
+ 	enc := json.NewEncoder(buffer)
+ 	enc.SetEscapeHTML(false)
+@@ -2079,6 +2113,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
+ 	}
+ 	serverReq.Header.Set("Content-Type", "application/json")
+ 
++	td.requestSent()
+ 	res, err := s.httpClient().Do(serverReq)
+ 	if err != nil {
+ 		if errors.Is(err, context.Canceled) {
+@@ -2148,7 +2183,16 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
+ 					Content:  choice.Delta.Content,
+ 					Thinking: choice.Delta.ReasoningContent,
+ 				},
+-				Logprobs: convertLogprobs(choice.Logprobs.Content, req.TopLogprobs > 0),
++				Logprobs: userLogprobs(choice.Logprobs.Content, req.Logprobs, req.TopLogprobs),
++			}
++
++			if td != nil {
++				hasDelta := choice.Delta.Content != "" || choice.Delta.ReasoningContent != "" ||
++					len(choice.Delta.ToolCalls) > 0 || len(choice.Logprobs.Content) > 0
++				eos := choice.FinishReason != nil && *choice.FinishReason == "stop"
++				if hasDelta || eos {
++					td.step(ctx, lsResp.Timings, choice.Logprobs.Content, eos)
++				}
+ 			}
+ 
+ 			for _, tc := range choice.Delta.ToolCalls {
+diff --git a/llm/llama_server_trace.go b/llm/llama_server_trace.go
+new file mode 100644
+index 00000000..7e43f98e
+--- /dev/null
++++ b/llm/llama_server_trace.go
+@@ -0,0 +1,238 @@
++package llm
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"log/slog"
++	"math"
++	"net/http"
++	"strconv"
++	"time"
++
++	"github.com/ollama/ollama/api"
++	"github.com/ollama/ollama/trace"
++)
++
++// traceTopK is how many candidates llama-server is asked for per token while
++// tracing, independent of what the client requested.
++const traceTopK = 10
++
++// traceDecode turns llama-server's streamed chunks into trace events. It is
++// nil, and every method a no-op, for untraced requests.
++type traceDecode struct {
++	tr      *trace.RequestTracer
++	opts    *api.Options
++	kvTotal int
++	eosID   int
++
++	sent        time.Time
++	tokenized   int // prompt tokens from /tokenize, -1 if unknown
++	prefilled   bool
++	promptTotal int
++	generated   int
++}
++
++func (s *llamaServerRunner) newTraceDecode(ctx context.Context, opts *api.Options) *traceDecode {
++	tr := trace.FromContext(ctx)
++	if tr == nil {
++		return nil
++	}
++	eos := -1
++	if s.metadata != nil {
++		if v, ok := s.metadata.KV().UintOK("tokenizer.ggml.eos_token_id"); ok {
++			eos = int(v)
++		}
++	}
++	return &traceDecode{tr: tr, opts: opts, kvTotal: s.options.NumCtx, eosID: eos, tokenized: -1}
++}
++
++// tokenize emits tokenize.done for the exact prompt sent to llama-server.
++// Best effort: failures are logged and skipped.
++func (d *traceDecode) tokenize(ctx context.Context, s *llamaServerRunner, content any) {
++	if d == nil {
++		return
++	}
++	tokens, err := s.tokenizeWithPieces(ctx, content)
++	if err != nil {
++		slog.Debug("trace: tokenize with pieces failed", "error", err)
++		return
++	}
++	d.tokenized = len(tokens)
++	d.tr.TokenizeDone(tokens)
++}
++
++func (d *traceDecode) requestSent() {
++	if d != nil {
++		d.sent = time.Now()
++	}
++}
++
++// prefill synthesizes one prefill batch on the first streamed chunk. With
++// timings_per_token llama-server reports how many prompt tokens it evaluated
++// (prompt_n), how many were reused from the cache (cache_n) and prompt_ms;
++// otherwise the first-token latency stands in for prefill time.
++func (d *traceDecode) prefill(t llamaServerTimings) {
++	if d.prefilled {
++		return
++	}
++	d.prefilled = true
++	if t.PromptN > 0 || t.PromptMS > 0 {
++		from := 0
++		if t.CacheN != nil {
++			from = *t.CacheN
++		}
++		d.promptTotal = from + t.PromptN
++		d.tr.Prefill(from, d.promptTotal, time.Duration(t.PromptMS*float64(time.Millisecond)))
++		return
++	}
++	d.promptTotal = max(d.tokenized, 0)
++	d.tr.Prefill(0, d.promptTotal, time.Since(d.sent))
++}
++
++// step emits decode.step.start, decode.logits and decode.sample for one
++// streamed chunk. A chunk usually carries one token; when llama-server holds
++// text back (partial UTF-8 or a partial stop string) it carries several, and
++// the step covers all of them.
++func (d *traceDecode) step(ctx context.Context, t llamaServerTimings, probs []llamaServerTokenProb, eos bool) {
++	if d == nil {
++		return
++	}
++	d.prefill(t)
++	step := d.tr.StepStart(ctx, d.promptTotal+d.generated, d.kvTotal)
++	// predicted_n (timings_per_token) counts every generated token, including
++	// ones whose probabilities llama-server folded into a held-back chunk.
++	if t.PredictN > d.generated {
++		d.generated = t.PredictN
++	} else {
++		d.generated += max(len(probs), 1)
++	}
++
++	chosen := -1
++	if len(probs) > 0 {
++		chosen = probs[0].ID
++		d.tr.Logits(step, traceCandidates(probs[0]))
++	} else {
++		d.tr.Logits(step, nil)
++	}
++	if eos {
++		if chosen < 0 {
++			chosen = d.eosID
++		}
++		d.tr.MarkEOS()
++	}
++
++	method := "dist"
++	if d.opts.Temperature <= 0 {
++		method = "greedy"
++	}
++	d.tr.Sample(step, chosen, f32(d.opts.Temperature), f32(d.opts.TopP), d.opts.TopK, method)
++}
++
++// f32 widens an option without float32 noise (0.7, not 0.699999988).
++func f32(v float32) float64 {
++	f, _ := strconv.ParseFloat(strconv.FormatFloat(float64(v), 'g', -1, 32), 64)
++	return f
++}
++
++func traceCandidates(p llamaServerTokenProb) []trace.Candidate {
++	top := p.TopLogprobs
++	useProb := false
++	if len(top) == 0 {
++		top, useProb = p.TopProbs, true
++	}
++	out := make([]trace.Candidate, 0, len(top))
++	for _, c := range top {
++		prob := c.Prob
++		if !useProb {
++			prob = math.Exp(c.Logprob)
++		}
++		out = append(out, trace.Candidate{ID: c.ID, Text: c.Token, P: math.Round(prob*1e6) / 1e6})
++	}
++	return out
++}
++
++// userLogprobs converts llama-server probabilities for the client. Tracing
++// asks llama-server for logprobs even when the client did not, so they are
++// dropped (or truncated to the requested top_logprobs) here.
++func userLogprobs(probs []llamaServerTokenProb, logprobs bool, topLogprobs int) []Logprob {
++	if !logprobs {
++		return nil
++	}
++	out := convertLogprobs(probs, topLogprobs > 0)
++	for i := range out {
++		if len(out[i].TopLogprobs) > topLogprobs {
++			out[i].TopLogprobs = out[i].TopLogprobs[:topLogprobs]
++		}
++	}
++	return out
++}
++
++// tokenizeWithPieces calls llama-server's /tokenize with with_pieces, using
++// the same add_special handling as /completion.
++func (s *llamaServerRunner) tokenizeWithPieces(ctx context.Context, content any) ([]trace.Token, error) {
++	data, err := json.Marshal(map[string]any{"content": content, "add_special": true, "with_pieces": true})
++	if err != nil {
++		return nil, err
++	}
++	r, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/tokenize", s.port), bytes.NewReader(data))
++	if err != nil {
++		return nil, err
++	}
++	r.Header.Set("Content-Type", "application/json")
++	resp, err := s.httpClient().Do(r)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, err
++	}
++	if resp.StatusCode >= 400 {
++		return nil, fmt.Errorf("tokenize error: %s", body)
++	}
++	var result struct {
++		Tokens []struct {
++			ID    int             `json:"id"`
++			Piece json.RawMessage `json:"piece"`
++		} `json:"tokens"`
++	}
++	if err := json.Unmarshal(body, &result); err != nil {
++		return nil, err
++	}
++	tokens := make([]trace.Token, len(result.Tokens))
++	for i, t := range result.Tokens {
++		tokens[i] = trace.Token{ID: t.ID, Text: pieceText(t.Piece)}
++	}
++	return tokens, nil
++}
++
++// pieceText decodes a /tokenize piece: a string, or a byte array when the
++// piece is not valid UTF-8 on its own.
++func pieceText(raw json.RawMessage) string {
++	var s string
++	if err := json.Unmarshal(raw, &s); err == nil {
++		return s
++	}
++	var b []int
++	if err := json.Unmarshal(raw, &b); err == nil {
++		buf := make([]byte, len(b))
++		for i, v := range b {
++			buf[i] = byte(v)
++		}
++		return string(buf)
++	}
++	return ""
++}
++
++func chatRequestHasMedia(req ChatRequest) bool {
++	for _, m := range req.Messages {
++		if len(m.Images) > 0 {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/llm/llama_server_trace_test.go b/llm/llama_server_trace_test.go
+new file mode 100644
+index 00000000..d30b0e5d
+--- /dev/null
++++ b/llm/llama_server_trace_test.go
+@@ -0,0 +1,47 @@
++package llm
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func TestUserLogprobsHidesTraceProbs(t *testing.T) {
++	top := make([]llamaServerTokenProb, 10)
++	for i := range top {
++		top[i] = llamaServerTokenProb{ID: i, Token: "t", Logprob: -float64(i)}
++	}
++	probs := []llamaServerTokenProb{{ID: 1, Token: "a", Logprob: -0.1, TopLogprobs: top}}
++
++	if got := userLogprobs(probs, false, 0); got != nil {
++		t.Fatalf("client did not ask for logprobs, got %v", got)
++	}
++	if got := userLogprobs(probs, true, 0); len(got) != 1 || len(got[0].TopLogprobs) != 0 {
++		t.Fatalf("logprobs without top: %+v", got)
++	}
++	if got := userLogprobs(probs, true, 3); len(got[0].TopLogprobs) != 3 {
++		t.Fatalf("top_logprobs not truncated to 3: %d", len(got[0].TopLogprobs))
++	}
++}
++
++func TestTraceCandidates(t *testing.T) {
++	c := traceCandidates(llamaServerTokenProb{TopLogprobs: []llamaServerTokenProb{{ID: 7, Token: "x", Logprob: 0}}})
++	if len(c) != 1 || c[0].ID != 7 || c[0].P != 1 {
++		t.Fatalf("got %+v", c)
++	}
++	c = traceCandidates(llamaServerTokenProb{TopProbs: []llamaServerTokenProb{{ID: 8, Token: "y", Prob: 0.25}}})
++	if c[0].P != 0.25 {
++		t.Fatalf("got %+v", c)
++	}
++}
++
++func TestPieceText(t *testing.T) {
++	if got := pieceText(json.RawMessage(`"hi"`)); got != "hi" {
++		t.Fatal(got)
++	}
++	if got := pieceText(json.RawMessage(`[240,159,140,149]`)); got != "🌕" {
++		t.Fatal(got)
++	}
++	if got := f32(0.7); got != 0.7 {
++		t.Fatal(got)
++	}
++}
+-- 
+2.47.1.windows.2
+

@@ -1,0 +1,1287 @@
+From a7ef01f948ef16e4cc9950f6e6a0104ab102b1a8 Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 14:33:54 -0700
+Subject: [PATCH 1/3] trace: add env-gated inference trace emitter
+
+Adds OLLAMA_TRACE_URL, OLLAMA_TRACE_DETAIL, OLLAMA_TRACE_STEP and
+OLLAMA_TRACE_STEP_TIMEOUT and a trace package that streams v1 visualizer
+events over a WebSocket. When the URL is unset every call is a no-op on a
+nil *RequestTracer. A single writer goroutine owns the socket, reconnects
+with backoff and never blocks callers: droppable events are discarded when
+the queue is full, critical events spill into a bounded overflow list. A
+reader goroutine handles step-mode acks.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ envconfig/config.go |  31 +++
+ go.mod              |   1 +
+ go.sum              |   2 +
+ trace/emitter.go    | 331 +++++++++++++++++++++++++++++
+ trace/trace_test.go | 331 +++++++++++++++++++++++++++++
+ trace/tracer.go     | 504 ++++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 1200 insertions(+)
+ create mode 100644 trace/emitter.go
+ create mode 100644 trace/trace_test.go
+ create mode 100644 trace/tracer.go
+
+diff --git a/envconfig/config.go b/envconfig/config.go
+index 0379a2ae..72ca26c8 100644
+--- a/envconfig/config.go
++++ b/envconfig/config.go
+@@ -163,6 +163,33 @@ func LoadTimeout() (loadTimeout time.Duration) {
+ 	return loadTimeout
+ }
+ 
++// TraceURL is the WebSocket URL of an LLM inference visualizer trace hub,
++// e.g. ws://127.0.0.1:4711/ingest. Tracing is disabled when it is empty.
++var TraceURL = String("OLLAMA_TRACE_URL")
++
++// TraceDetail is the default trace detail level: basic, layers or full.
++var TraceDetail = String("OLLAMA_TRACE_DETAIL")
++
++// TraceStep enables trace step mode for every request (e.g. "token").
++var TraceStep = String("OLLAMA_TRACE_STEP")
++
++// TraceStepTimeout returns how long a traced request in step mode waits for an
++// ack before continuing. Configured via OLLAMA_TRACE_STEP_TIMEOUT. Default 60s.
++func TraceStepTimeout() time.Duration {
++	timeout := 60 * time.Second
++	if s := Var("OLLAMA_TRACE_STEP_TIMEOUT"); s != "" {
++		if d, err := time.ParseDuration(s); err == nil {
++			timeout = d
++		} else if n, err := strconv.ParseInt(s, 10, 64); err == nil {
++			timeout = time.Duration(n) * time.Second
++		}
++	}
++	if timeout <= 0 {
++		return 60 * time.Second
++	}
++	return timeout
++}
++
+ func Remotes() []string {
+ 	var r []string
+ 	raw := strings.TrimSpace(Var("OLLAMA_REMOTES"))
+@@ -339,6 +366,10 @@ func AsMap() map[string]EnvVar {
+ 		"OLLAMA_CREATE_REMOTE":        {"OLLAMA_CREATE_REMOTE", CreateRemote(), "Force model creation through the server API even when the server is local"},
+ 		"OLLAMA_EDITOR":               {"OLLAMA_EDITOR", Editor(), "Path to editor for interactive prompt editing (Ctrl+G)"},
+ 		"OLLAMA_REMOTES":              {"OLLAMA_REMOTES", Remotes(), "Allowed hosts for remote models (default \"ollama.com\")"},
++		"OLLAMA_TRACE_URL":            {"OLLAMA_TRACE_URL", TraceURL(), "WebSocket URL of an inference visualizer trace hub (e.g. ws://127.0.0.1:4711/ingest)"},
++		"OLLAMA_TRACE_DETAIL":         {"OLLAMA_TRACE_DETAIL", TraceDetail(), "Default trace detail level: basic, layers or full (default basic)"},
++		"OLLAMA_TRACE_STEP":           {"OLLAMA_TRACE_STEP", TraceStep(), "Trace step mode for every request (token)"},
++		"OLLAMA_TRACE_STEP_TIMEOUT":   {"OLLAMA_TRACE_STEP_TIMEOUT", TraceStepTimeout(), "How long a step-mode request waits for an ack (default \"60s\")"},
+ 
+ 		// Informational
+ 		"HTTP_PROXY":  {"HTTP_PROXY", String("HTTP_PROXY")(), "HTTP proxy"},
+diff --git a/go.mod b/go.mod
+index ebd0a528..5d13ccc6 100644
+--- a/go.mod
++++ b/go.mod
+@@ -47,6 +47,7 @@ require (
+ 	github.com/charmbracelet/x/cellbuf v0.0.13-0.20250311204145-2c3ea96c31dd // indirect
+ 	github.com/charmbracelet/x/term v0.2.1 // indirect
+ 	github.com/cloudwego/base64x v0.1.7 // indirect
++	github.com/coder/websocket v1.8.15 // indirect
+ 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
+ 	github.com/goccy/go-yaml v1.19.2 // indirect
+ 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
+diff --git a/go.sum b/go.sum
+index 9f5be001..e05e2489 100644
+--- a/go.sum
++++ b/go.sum
+@@ -30,6 +30,8 @@ github.com/charmbracelet/x/term v0.2.1 h1:AQeHeLZ1OqSXhrAWpYUtZyX1T3zVxfpZuEQMIQ
+ github.com/charmbracelet/x/term v0.2.1/go.mod h1:oQ4enTYFV7QN4m0i9mzHrViD7TQKvNEEkHUMCmsxdUg=
+ github.com/cloudwego/base64x v0.1.7 h1:NppS+Fgzg5ovhn4NkUXaDT3x9jldgH5ToMCqzBSi2zI=
+ github.com/cloudwego/base64x v0.1.7/go.mod h1:Cu1PV9zfrSf7ET2tIbWbbEy7jO7HHJ13q4X2SQ8aWYg=
++github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
++github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
+ github.com/containerd/console v1.0.3 h1:lIr7SlA5PxZyMV30bDW0MGbiOPXwc63yRuCP0ARubLw=
+ github.com/containerd/console v1.0.3/go.mod h1:7LqA/THxQ86k76b8c/EMSiaJ3h1eZkMkXar0TQ1gf3U=
+ github.com/cpuguy83/go-md2man/v2 v2.0.2/go.mod h1:tgQtvFlXSQOSOSIRvRPT7W67SCa46tRHOmNcaadrF8o=
+diff --git a/trace/emitter.go b/trace/emitter.go
+new file mode 100644
+index 00000000..0eb811a5
+--- /dev/null
++++ b/trace/emitter.go
+@@ -0,0 +1,331 @@
++// Package trace streams inference trace events to an LLM inference
++// visualizer over a WebSocket. It is disabled, and every call is a cheap
++// no-op, unless OLLAMA_TRACE_URL is set.
++//
++// Events follow the v1 schema in packages/trace-schema of the visualizer:
++// {v:1, req, seq, t_ns, type, ...payload}, one JSON object per line.
++package trace
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"log/slog"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/coder/websocket"
++
++	"github.com/ollama/ollama/envconfig"
++)
++
++const (
++	// queueCap bounds the ordered event queue. When it is full, droppable
++	// events are discarded and critical events spill into the overflow list.
++	queueCap = 10000
++	// overflowCap bounds the critical overflow so a hub that never drains
++	// cannot grow memory without limit.
++	overflowCap = 200000
++	// disconnectGrace is how long events are kept while the hub is
++	// unreachable before they are discarded.
++	disconnectGrace = 5 * time.Second
++
++	maxBatchEvents = 256
++	maxBatchBytes  = 256 << 10
++	writeTimeout   = 10 * time.Second
++	dialTimeout    = 5 * time.Second
++	minBackoff     = 250 * time.Millisecond
++	maxBackoff     = 5 * time.Second
++)
++
++// critical mirrors PRIORITY in packages/trace-schema: critical events are
++// never dropped by the emitter; everything else is droppable.
++var critical = map[string]bool{
++	"request.received":    true,
++	"model.load":          true,
++	"tokenize.done":       true,
++	"prefill.batch":       true,
++	"prefill.done":        true,
++	"decode.step.start":   true,
++	"decode.logits":       true,
++	"decode.sample":       true,
++	"decode.token":        true,
++	"request.done":        true,
++	"request.error":       true,
++	"decode.sample.stage": true,
++	"step.timeout":        true,
++}
++
++type config struct {
++	url         string
++	detail      Detail
++	step        string
++	stepTimeout time.Duration
++}
++
++type emitter struct {
++	cfg  config
++	base time.Time // monotonic origin for t_ns
++
++	queue chan []byte
++	wake  chan struct{}
++
++	mu          sync.Mutex
++	overflow    [][]byte
++	overflowLen atomic.Int64
++
++	dropped   atomic.Uint64
++	connected atomic.Bool
++
++	waiters   sync.Map // req id -> *RequestTracer in step mode
++	stepOwner atomic.Pointer[RequestTracer]
++}
++
++var (
++	global   *emitter
++	initOnce sync.Once
++)
++
++// Init reads the OLLAMA_TRACE_* environment and, when OLLAMA_TRACE_URL is set,
++// starts the background writer. It is safe to call more than once; the first
++// traced request calls it implicitly.
++func Init() { get() }
++
++func get() *emitter {
++	initOnce.Do(func() {
++		url := envconfig.TraceURL()
++		if url == "" {
++			return
++		}
++		detail, _ := ParseDetail(envconfig.TraceDetail())
++		global = newEmitter(config{
++			url:         url,
++			detail:      detail,
++			step:        envconfig.TraceStep(),
++			stepTimeout: envconfig.TraceStepTimeout(),
++		})
++		slog.Info("inference tracing enabled", "url", url, "detail", detail.String())
++		go global.run(context.Background())
++	})
++	return global
++}
++
++// Enabled reports whether tracing is configured.
++func Enabled() bool { return get() != nil }
++
++func newEmitter(cfg config) *emitter {
++	if cfg.stepTimeout <= 0 {
++		cfg.stepTimeout = 60 * time.Second
++	}
++	return &emitter{
++		cfg:   cfg,
++		base:  time.Now(),
++		queue: make(chan []byte, queueCap),
++		wake:  make(chan struct{}, 1),
++	}
++}
++
++// enqueue never blocks. Order is preserved: once the overflow list holds
++// anything, new events go there too until the writer has drained it.
++func (e *emitter) enqueue(b []byte, crit bool) {
++	if e.overflowLen.Load() == 0 {
++		select {
++		case e.queue <- b:
++			return
++		default:
++		}
++	}
++	if !crit {
++		e.dropped.Add(1)
++		return
++	}
++	e.mu.Lock()
++	if len(e.overflow) >= overflowCap {
++		e.mu.Unlock()
++		e.dropped.Add(1)
++		return
++	}
++	e.overflow = append(e.overflow, b)
++	e.overflowLen.Store(int64(len(e.overflow)))
++	e.mu.Unlock()
++	select {
++	case e.wake <- struct{}{}:
++	default:
++	}
++}
++
++func (e *emitter) popOverflow() []byte {
++	if e.overflowLen.Load() == 0 {
++		return nil
++	}
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	if len(e.overflow) == 0 {
++		return nil
++	}
++	b := e.overflow[0]
++	e.overflow[0] = nil
++	e.overflow = e.overflow[1:]
++	e.overflowLen.Store(int64(len(e.overflow)))
++	return b
++}
++
++// tryNext returns the next queued event without blocking. The queue holds
++// older events than the overflow list, so it is drained first.
++func (e *emitter) tryNext() []byte {
++	select {
++	case b := <-e.queue:
++		return b
++	default:
++		return e.popOverflow()
++	}
++}
++
++func (e *emitter) next(ctx context.Context) []byte {
++	for {
++		if b := e.tryNext(); b != nil {
++			return b
++		}
++		select {
++		case b := <-e.queue:
++			return b
++		case <-e.wake:
++		case <-ctx.Done():
++			return nil
++		}
++	}
++}
++
++// batch joins the first event with whatever else is already queued into one
++// newline-delimited WebSocket message.
++func (e *emitter) batch(first []byte) []byte {
++	buf := append([]byte(nil), first...)
++	for n := 1; n < maxBatchEvents && len(buf) < maxBatchBytes; n++ {
++		b := e.tryNext()
++		if b == nil {
++			break
++		}
++		buf = append(buf, '\n')
++		buf = append(buf, b...)
++	}
++	return buf
++}
++
++func (e *emitter) discard() {
++	for e.tryNext() != nil {
++		e.dropped.Add(1)
++	}
++}
++
++func (e *emitter) run(ctx context.Context) {
++	backoff := minBackoff
++	disconnectedAt := time.Now()
++	warned := false
++	var pending []byte
++
++	for ctx.Err() == nil {
++		dctx, cancel := context.WithTimeout(ctx, dialTimeout)
++		conn, _, err := websocket.Dial(dctx, e.cfg.url, nil)
++		cancel()
++		if err != nil {
++			if !warned {
++				slog.Warn("trace hub unreachable, retrying quietly", "url", e.cfg.url, "error", err)
++				warned = true
++			}
++			if time.Since(disconnectedAt) > disconnectGrace {
++				pending = nil
++				e.discard()
++			}
++			select {
++			case <-time.After(backoff):
++			case <-ctx.Done():
++				return
++			}
++			backoff = min(backoff*2, maxBackoff)
++			continue
++		}
++
++		slog.Info("trace hub connected", "url", e.cfg.url)
++		warned = false
++		backoff = minBackoff
++		conn.SetReadLimit(1 << 20)
++		e.connected.Store(true)
++
++		cctx, cancelConn := context.WithCancel(ctx)
++		go e.readLoop(cctx, cancelConn, conn)
++		err = e.writeLoop(cctx, conn, &pending)
++		e.connected.Store(false)
++		disconnectedAt = time.Now()
++		cancelConn()
++		conn.CloseNow()
++		slog.Info("trace hub disconnected", "error", err, "dropped", e.dropped.Load())
++	}
++}
++
++func (e *emitter) writeLoop(ctx context.Context, conn *websocket.Conn, pending *[]byte) error {
++	for {
++		if *pending == nil {
++			b := e.next(ctx)
++			if b == nil {
++				return ctx.Err()
++			}
++			*pending = e.batch(b)
++		}
++		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
++		err := conn.Write(wctx, websocket.MessageText, *pending)
++		cancel()
++		if err != nil {
++			return err // keep pending so it is resent after reconnecting
++		}
++		*pending = nil
++	}
++}
++
++func (e *emitter) readLoop(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
++	defer cancel()
++	for {
++		typ, data, err := conn.Read(ctx)
++		if err != nil {
++			return
++		}
++		if typ != websocket.MessageText {
++			continue
++		}
++		for line := range bytes.SplitSeq(data, []byte("\n")) {
++			e.handleControl(line)
++		}
++	}
++}
++
++// ackMessage mirrors AckMessage in packages/trace-schema.
++type ackMessage struct {
++	V           int    `json:"v"`
++	Type        string `json:"type"`
++	Req         string `json:"req"`
++	Granularity string `json:"granularity,omitempty"`
++	Continue    bool   `json:"continue,omitempty"`
++}
++
++func (e *emitter) handleControl(line []byte) {
++	line = bytes.TrimSpace(line)
++	if len(line) == 0 {
++		return
++	}
++	var msg ackMessage
++	if err := json.Unmarshal(line, &msg); err != nil || msg.V != 1 || msg.Type != "ack" {
++		return
++	}
++	if v, ok := e.waiters.Load(msg.Req); ok {
++		v.(*RequestTracer).ack(msg.Continue)
++	}
++}
++
++func stepEnabled(s string) bool {
++	switch strings.ToLower(strings.TrimSpace(s)) {
++	case "", "0", "false", "off", "no":
++		return false
++	}
++	return true
++}
+diff --git a/trace/trace_test.go b/trace/trace_test.go
+new file mode 100644
+index 00000000..885113ca
+--- /dev/null
++++ b/trace/trace_test.go
+@@ -0,0 +1,331 @@
++package trace
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"slices"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/coder/websocket"
++)
++
++func testEmitter(t *testing.T) *emitter {
++	t.Helper()
++	return newEmitter(config{url: "ws://unused", stepTimeout: time.Second})
++}
++
++func drain(e *emitter) []map[string]any {
++	var out []map[string]any
++	for b := e.tryNext(); b != nil; b = e.tryNext() {
++		var m map[string]any
++		if err := json.Unmarshal(b, &m); err != nil {
++			panic(string(b) + ": " + err.Error())
++		}
++		out = append(out, m)
++	}
++	return out
++}
++
++func TestDisabledIsNoop(t *testing.T) {
++	t.Setenv("OLLAMA_TRACE_URL", "")
++	if tr := NewRequest("x", "", ""); tr != nil {
++		t.Fatal("expected nil tracer when OLLAMA_TRACE_URL is unset")
++	}
++	var tr *RequestTracer
++	ctx := context.Background()
++	allocs := testing.AllocsPerRun(100, func() {
++		tr.Received("m", 3, nil)
++		tr.ModelLoadStart(1, 2)
++		tr.Prefill(0, 4, time.Millisecond)
++		step := tr.StepStart(ctx, 1, 2)
++		tr.Sample(step, 1, 0.8, 0.9, 40, "dist")
++		tr.Token(ctx, "hi", false)
++		tr.Done(Stats{})
++		tr.End(true, "")
++		_ = FromContext(ctx)
++		_ = NewContext(ctx, tr)
++	})
++	if allocs != 0 {
++		t.Fatalf("nil tracer allocated %v times per run", allocs)
++	}
++}
++
++func TestSeqMonotonicAndEnvelope(t *testing.T) {
++	e := testEmitter(t)
++	tr := e.newRequest("req-1", "full", "")
++	ctx := context.Background()
++	tr.Received("llama3.2", 5, map[string]any{"temperature": 0.7})
++	tr.ModelLoadStart(28, 4096)
++	tr.ModelLoadDone(28, 4096, 2048, 800*time.Millisecond)
++	tr.TokenizeDone([]Token{{ID: 1, Text: "Hi"}})
++	tr.Prefill(0, 1, 12*time.Millisecond)
++	s := tr.StepStart(ctx, 1, 4096)
++	tr.Logits(s, []Candidate{{ID: 5, Text: "!", P: 0.6}, {ID: 6, Text: ".", P: 0.4}})
++	tr.Sample(s, 5, 0.7, 0.9, 40, "dist")
++	tr.Token(ctx, "!", false)
++	s = tr.StepStart(ctx, 2, 4096)
++	tr.MarkEOS()
++	tr.Token(ctx, "", true)
++	tr.Done(Stats{EvalCount: 2})
++	tr.Error("ignored after done")
++
++	evs := drain(e)
++	var last float64 = -1
++	var lastT float64 = -1
++	for _, ev := range evs {
++		if ev["v"] != 1.0 || ev["req"] != "req-1" {
++			t.Fatalf("bad envelope %v", ev)
++		}
++		seq := ev["seq"].(float64)
++		if seq != last+1 {
++			t.Fatalf("seq not contiguous: %v after %v", seq, last)
++		}
++		last = seq
++		tn := ev["t_ns"].(float64)
++		if tn < lastT {
++			t.Fatalf("t_ns went backwards")
++		}
++		lastT = tn
++	}
++	types := make([]string, len(evs))
++	for i, ev := range evs {
++		types[i] = ev["type"].(string)
++	}
++	want := []string{
++		"request.received", "model.load", "model.load", "tokenize.done", "prefill.batch", "prefill.done",
++		"decode.step.start", "decode.logits", "decode.sample", "decode.token", "stream.chunk",
++		"decode.step.start", "decode.token", "request.done",
++	}
++	if !slices.Equal(types, want) {
++		t.Fatalf("types\n got %v\nwant %v", types, want)
++	}
++	if evs[12]["is_eos"] != true || evs[12]["step"] != 1.0 {
++		t.Fatalf("eos token wrong: %v", evs[12])
++	}
++}
++
++// TestSchemaFieldNames pins payload keys to packages/trace-schema.
++func TestSchemaFieldNames(t *testing.T) {
++	e := testEmitter(t)
++	tr := e.newRequest("r", "full", "")
++	ctx := context.Background()
++	tr.Received("m", 1, nil)
++	tr.ModelLoadStart(1, 2)
++	tr.ModelLoadDone(1, 2, 3, time.Second)
++	tr.TokenizeDone(nil)
++	tr.Prefill(0, 1, time.Millisecond)
++	s := tr.StepStart(ctx, 1, 2)
++	tr.Logits(s, nil)
++	tr.Sample(s, 1, 1, 1, 1, "dist")
++	tr.Token(ctx, "a", false)
++	tr.Done(Stats{})
++	tr2 := e.newRequest("r2", "", "")
++	tr2.Error("boom")
++	tr2.emit("step.timeout", stepTimeout{Step: 0, Granularity: "token"})
++
++	env := []string{"v", "req", "seq", "t_ns", "type"}
++	want := map[string][]string{
++		"request.received":  {"model", "prompt_chars", "options", "detail", "capabilities"},
++		"model.load":        {"phase", "layers", "ctx", "vram_mb"},
++		"tokenize.done":     {"n", "tokens"},
++		"prefill.batch":     {"batch_i", "of", "from", "to", "ms"},
++		"prefill.done":      {"n_tokens", "ms"},
++		"decode.step.start": {"step", "kv_used", "kv_total"},
++		"decode.logits":     {"step", "topk", "entropy"},
++		"decode.sample":     {"step", "chosen_id", "temp", "top_p", "top_k", "method"},
++		"decode.token":      {"step", "text", "is_eos"},
++		"stream.chunk":      {"step", "bytes", "utf8_complete", "text"},
++		"request.done":      {"stats"},
++		"request.error":     {"message"},
++		"step.timeout":      {"step", "granularity"},
++	}
++	for _, ev := range drain(e) {
++		typ := ev["type"].(string)
++		keys, ok := want[typ]
++		if !ok {
++			t.Fatalf("unexpected type %s", typ)
++		}
++		for _, k := range append(env, keys...) {
++			if _, ok := ev[k]; !ok {
++				t.Errorf("%s missing %q: %v", typ, k, ev)
++			}
++		}
++		for k := range ev {
++			if !slices.Contains(env, k) && !slices.Contains(keys, k) && !(typ == "model.load" && k == "ms") {
++				t.Errorf("%s has unexpected key %q", typ, k)
++			}
++		}
++		if typ == "request.done" {
++			stats := ev["stats"].(map[string]any)
++			for _, k := range []string{"prompt_eval_count", "prompt_eval_ms", "eval_count", "eval_ms", "load_ms", "total_ms"} {
++				if _, ok := stats[k]; !ok {
++					t.Errorf("stats missing %q", k)
++				}
++			}
++		}
++		if typ == "tokenize.done" && ev["tokens"] == nil {
++			t.Error("tokens must be an array, not null")
++		}
++		if typ == "request.received" {
++			if _, ok := ev["options"].(map[string]any); !ok {
++				t.Error("options must be an object")
++			}
++		}
++	}
++}
++
++func TestDropPolicyKeepsCritical(t *testing.T) {
++	e := testEmitter(t)
++	for range queueCap {
++		e.enqueue([]byte(`{"n":"fill"}`), false)
++	}
++	e.enqueue([]byte(`{"n":"droppable"}`), false)
++	e.enqueue([]byte(`{"n":"crit1"}`), true)
++	e.enqueue([]byte(`{"n":"droppable2"}`), false)
++	e.enqueue([]byte(`{"n":"crit2"}`), true)
++	if got := e.dropped.Load(); got != 2 {
++		t.Fatalf("dropped = %d, want 2", got)
++	}
++	var names []string
++	for b := e.tryNext(); b != nil; b = e.tryNext() {
++		names = append(names, string(b))
++	}
++	if len(names) != queueCap+2 {
++		t.Fatalf("got %d events", len(names))
++	}
++	if names[queueCap] != `{"n":"crit1"}` || names[queueCap+1] != `{"n":"crit2"}` {
++		t.Fatalf("critical events lost or reordered: %v", names[queueCap:])
++	}
++	// overflow drained: the fast path is usable again
++	e.enqueue([]byte(`{"n":"after"}`), false)
++	if b := e.tryNext(); string(b) != `{"n":"after"}` {
++		t.Fatalf("got %s", b)
++	}
++}
++
++func TestStepModeAckAndTimeout(t *testing.T) {
++	e := newEmitter(config{url: "ws://unused", stepTimeout: 50 * time.Millisecond})
++	e.connected.Store(true)
++	ctx := context.Background()
++
++	tr := e.newRequest("step-req", "", "token")
++	if !tr.Stepping() {
++		t.Fatal("expected step mode")
++	}
++	if other := e.newRequest("other", "", "token"); other.Stepping() {
++		t.Fatal("only one request may be in step mode")
++	}
++
++	// timeout path
++	start := time.Now()
++	tr.StepStart(ctx, 0, 0)
++	if time.Since(start) < 40*time.Millisecond {
++		t.Fatal("step did not wait")
++	}
++
++	// ack releases one step
++	go func() {
++		time.Sleep(10 * time.Millisecond)
++		e.handleControl([]byte(`{"v":1,"type":"ack","req":"step-req","granularity":"token"}`))
++	}()
++	start = time.Now()
++	tr.StepStart(ctx, 1, 0)
++	if d := time.Since(start); d > 45*time.Millisecond {
++		t.Fatalf("ack did not release the step (%v)", d)
++	}
++
++	// continue leaves step mode for good
++	e.handleControl([]byte(`{"v":1,"type":"ack","req":"step-req","continue":true}`))
++	tr.StepStart(ctx, 2, 0) // consumes the buffered ack
++	if tr.Stepping() {
++		t.Fatal("continue should release step mode")
++	}
++	start = time.Now()
++	tr.StepStart(ctx, 3, 0)
++	if time.Since(start) > 20*time.Millisecond {
++		t.Fatal("free-running step blocked")
++	}
++	tr.End(true, "")
++	if e.stepOwner.Load() != nil {
++		t.Fatal("step owner not released")
++	}
++
++	var timeouts int
++	for _, ev := range drain(e) {
++		if ev["type"] == "step.timeout" {
++			timeouts++
++			if ev["step"] != 0.0 || ev["granularity"] != "token" {
++				t.Fatalf("bad step.timeout %v", ev)
++			}
++		}
++	}
++	if timeouts != 1 {
++		t.Fatalf("got %d step.timeout events, want 1", timeouts)
++	}
++}
++
++func TestWebSocketRoundTrip(t *testing.T) {
++	got := make(chan string, 100)
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		c, err := websocket.Accept(w, r, nil)
++		if err != nil {
++			return
++		}
++		defer c.CloseNow()
++		for {
++			_, data, err := c.Read(r.Context())
++			if err != nil {
++				return
++			}
++			for line := range strings.SplitSeq(string(data), "\n") {
++				got <- line
++				if strings.Contains(line, `"decode.step.start"`) || strings.Contains(line, `"request.received"`) {
++					_ = c.Write(r.Context(), websocket.MessageText, []byte(`{"v":1,"type":"ack","req":"ws-req"}`))
++				}
++			}
++		}
++	}))
++	defer srv.Close()
++
++	e := newEmitter(config{url: "ws" + strings.TrimPrefix(srv.URL, "http") + "/ingest", stepTimeout: 5 * time.Second})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go e.run(ctx)
++	deadline := time.Now().Add(5 * time.Second)
++	for !e.connected.Load() && time.Now().Before(deadline) {
++		time.Sleep(5 * time.Millisecond)
++	}
++
++	tr := e.newRequest("ws-req", "", "token")
++	tr.Received("m", 1, nil)
++	start := time.Now()
++	tr.StepStart(ctx, 0, 0) // released by the ack for request.received
++	tr.StepStart(ctx, 1, 0) // released by the ack sent for step 0
++	if time.Since(start) > 4*time.Second {
++		t.Fatal("ack over websocket did not release the step")
++	}
++	tr.End(true, "")
++
++	var types []string
++	timeout := time.After(5 * time.Second)
++	for len(types) < 5 {
++		select {
++		case line := <-got:
++			var m map[string]any
++			if err := json.Unmarshal([]byte(line), &m); err != nil {
++				t.Fatalf("bad line %q", line)
++			}
++			types = append(types, m["type"].(string))
++		case <-timeout:
++			t.Fatalf("only received %v", types)
++		}
++	}
++	want := []string{"request.received", "decode.step.start", "decode.token", "decode.step.start", "decode.token"}
++	if !slices.Equal(types, want) {
++		t.Fatalf("got %v want %v", types, want)
++	}
++}
+diff --git a/trace/tracer.go b/trace/tracer.go
+new file mode 100644
+index 00000000..69190658
+--- /dev/null
++++ b/trace/tracer.go
+@@ -0,0 +1,504 @@
++package trace
++
++import (
++	"context"
++	"encoding/json"
++	"log/slog"
++	"math"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"time"
++	"unicode/utf8"
++
++	"github.com/google/uuid"
++)
++
++// Detail is the trace detail level requested for a request.
++type Detail int
++
++const (
++	Basic Detail = iota
++	Layers
++	Full
++)
++
++func (d Detail) String() string {
++	switch d {
++	case Layers:
++		return "layers"
++	case Full:
++		return "full"
++	default:
++		return "basic"
++	}
++}
++
++// ParseDetail parses basic|layers|full. Unknown values yield Basic, false.
++func ParseDetail(s string) (Detail, bool) {
++	switch strings.ToLower(strings.TrimSpace(s)) {
++	case "basic":
++		return Basic, true
++	case "layers":
++		return Layers, true
++	case "full":
++		return Full, true
++	}
++	return Basic, false
++}
++
++// Header names the visualizer sends with /api/chat and /api/generate.
++const (
++	HeaderRequestID = "X-Trace-Request-Id"
++	HeaderDetail    = "X-Trace-Detail"
++	HeaderStep      = "X-Trace-Step"
++)
++
++// RequestTracer emits the events of one request. A nil *RequestTracer is
++// valid and every method on it is a no-op.
++//
++// Step, token and terminal methods are meant to be called from the single
++// goroutine that drives the request's response stream.
++type RequestTracer struct {
++	e       *emitter
++	req     string
++	reqJSON []byte
++	detail  Detail
++	stepReq string
++	seq     atomic.Int64
++
++	stepping atomic.Bool
++	ackCh    chan struct{}
++	finished atomic.Bool
++	start    time.Time
++
++	step      int // current decode step, -1 before the first
++	tokenSent bool
++	eos       bool
++}
++
++// NewRequest returns a tracer for one request, or nil when tracing is
++// disabled. id, detail and step are the X-Trace-* header values; an empty id
++// gets a generated UUID and empty detail/step fall back to the environment.
++func NewRequest(id, detail, step string) *RequestTracer {
++	e := get()
++	if e == nil {
++		return nil
++	}
++	return e.newRequest(id, detail, step)
++}
++
++func (e *emitter) newRequest(id, detail, step string) *RequestTracer {
++	if id == "" {
++		id = uuid.NewString()
++	}
++	d := e.cfg.detail
++	if v, ok := ParseDetail(detail); ok {
++		d = v
++	}
++	if step == "" {
++		step = e.cfg.step
++	}
++	reqJSON, _ := json.Marshal(id)
++	t := &RequestTracer{e: e, req: id, reqJSON: reqJSON, detail: d, start: time.Now(), step: -1}
++	if stepEnabled(step) {
++		t.stepReq = strings.ToLower(strings.TrimSpace(step))
++		if e.stepOwner.CompareAndSwap(nil, t) {
++			t.ackCh = make(chan struct{}, 1)
++			t.stepping.Store(true)
++			e.waiters.Store(id, t)
++		} else {
++			slog.Warn("trace step mode already in use by another request; running freely", "req", id)
++		}
++	}
++	return t
++}
++
++type ctxKey struct{}
++
++// NewContext returns ctx carrying t. A nil t returns ctx unchanged.
++func NewContext(ctx context.Context, t *RequestTracer) context.Context {
++	if t == nil {
++		return ctx
++	}
++	return context.WithValue(ctx, ctxKey{}, t)
++}
++
++// FromContext returns the request tracer in ctx, or nil.
++func FromContext(ctx context.Context) *RequestTracer {
++	if ctx == nil {
++		return nil
++	}
++	t, _ := ctx.Value(ctxKey{}).(*RequestTracer)
++	return t
++}
++
++// ID returns the trace request id.
++func (t *RequestTracer) ID() string {
++	if t == nil {
++		return ""
++	}
++	return t.req
++}
++
++// Detail returns the detail level for this request.
++func (t *RequestTracer) Detail() Detail {
++	if t == nil {
++		return Basic
++	}
++	return t.detail
++}
++
++// Stepping reports whether the request is currently in step mode.
++func (t *RequestTracer) Stepping() bool { return t != nil && t.stepping.Load() }
++
++func (t *RequestTracer) emit(typ string, payload any) {
++	body, err := json.Marshal(payload)
++	if err != nil {
++		slog.Debug("trace marshal failed", "type", typ, "error", err)
++		return
++	}
++	seq := t.seq.Add(1) - 1
++	tns := time.Since(t.e.base).Nanoseconds()
++
++	buf := make([]byte, 0, 64+len(t.reqJSON)+len(typ)+len(body))
++	buf = append(buf, `{"v":1,"req":`...)
++	buf = append(buf, t.reqJSON...)
++	buf = append(buf, `,"seq":`...)
++	buf = strconv.AppendInt(buf, seq, 10)
++	buf = append(buf, `,"t_ns":`...)
++	buf = strconv.AppendInt(buf, tns, 10)
++	buf = append(buf, `,"type":"`...)
++	buf = append(buf, typ...)
++	buf = append(buf, '"')
++	if len(body) > 2 {
++		buf = append(buf, ',')
++		buf = append(buf, body[1:]...)
++	} else {
++		buf = append(buf, '}')
++	}
++	t.e.enqueue(buf, critical[typ])
++}
++
++// ---- payloads (field names mirror packages/trace-schema) -----------------
++
++type requestReceived struct {
++	Model        string         `json:"model"`
++	PromptChars  int            `json:"prompt_chars"`
++	Options      map[string]any `json:"options"`
++	Detail       string         `json:"detail"`
++	Capabilities []string       `json:"capabilities,omitempty"`
++}
++
++type modelLoad struct {
++	Phase  string   `json:"phase"`
++	Layers int      `json:"layers"`
++	Ctx    int      `json:"ctx"`
++	VramMB float64  `json:"vram_mb"`
++	MS     *float64 `json:"ms,omitempty"`
++}
++
++// Token is a prompt token for tokenize.done.
++type Token struct {
++	ID   int    `json:"id"`
++	Text string `json:"text"`
++}
++
++type tokenizeDone struct {
++	N      int     `json:"n"`
++	Tokens []Token `json:"tokens"`
++}
++
++type prefillBatch struct {
++	BatchI int     `json:"batch_i"`
++	Of     int     `json:"of"`
++	From   int     `json:"from"`
++	To     int     `json:"to"`
++	MS     float64 `json:"ms"`
++}
++
++type prefillDone struct {
++	NTokens int     `json:"n_tokens"`
++	MS      float64 `json:"ms"`
++}
++
++type decodeStepStart struct {
++	Step    int `json:"step"`
++	KVUsed  int `json:"kv_used"`
++	KVTotal int `json:"kv_total"`
++}
++
++// Candidate is one top-k entry for decode.logits.
++type Candidate struct {
++	ID   int     `json:"id"`
++	Text string  `json:"text"`
++	P    float64 `json:"p"`
++}
++
++type decodeLogits struct {
++	Step    int         `json:"step"`
++	TopK    []Candidate `json:"topk"`
++	Entropy float64     `json:"entropy"`
++}
++
++type decodeSample struct {
++	Step     int     `json:"step"`
++	ChosenID int     `json:"chosen_id"`
++	Temp     float64 `json:"temp"`
++	TopP     float64 `json:"top_p"`
++	TopK     int     `json:"top_k"`
++	Method   string  `json:"method"`
++}
++
++type decodeToken struct {
++	Step  int    `json:"step"`
++	Text  string `json:"text"`
++	IsEOS bool   `json:"is_eos"`
++}
++
++type streamChunk struct {
++	Step         int    `json:"step"`
++	Bytes        int    `json:"bytes"`
++	UTF8Complete bool   `json:"utf8_complete"`
++	Text         string `json:"text"`
++}
++
++// Stats is the request.done payload; all durations are milliseconds.
++type Stats struct {
++	PromptEvalCount int     `json:"prompt_eval_count"`
++	PromptEvalMS    float64 `json:"prompt_eval_ms"`
++	EvalCount       int     `json:"eval_count"`
++	EvalMS          float64 `json:"eval_ms"`
++	LoadMS          float64 `json:"load_ms"`
++	TotalMS         float64 `json:"total_ms"`
++}
++
++type requestDone struct {
++	Stats Stats `json:"stats"`
++}
++
++type requestError struct {
++	Message string `json:"message"`
++}
++
++type stepTimeout struct {
++	Step        int    `json:"step"`
++	Granularity string `json:"granularity"`
++}
++
++// ---- events ---------------------------------------------------------------
++
++// Capabilities lists what this emitter cannot provide. Everything below the
++// HTTP boundary of llama-server needs a patched llama.cpp (see
++// ollama-patch/NOTES.md).
++func (t *RequestTracer) Capabilities() []string {
++	caps := []string{
++		"no_layers", "no_ops", "no_residual", "no_attn", "no_kv_writes",
++		"no_sample_stages", "no_tokenize_merge", "prefill_synthesized",
++	}
++	if t != nil && (t.stepReq == "layer" || t.stepReq == "sample") {
++		caps = append(caps, "step_token_only")
++	}
++	return caps
++}
++
++// Received emits request.received.
++func (t *RequestTracer) Received(model string, promptChars int, options map[string]any) {
++	if t == nil {
++		return
++	}
++	if options == nil {
++		options = map[string]any{}
++	}
++	t.emit("request.received", requestReceived{
++		Model: model, PromptChars: promptChars, Options: options,
++		Detail: t.detail.String(), Capabilities: t.Capabilities(),
++	})
++}
++
++// ModelLoadStart emits model.load phase=start.
++func (t *RequestTracer) ModelLoadStart(layers, ctx int) {
++	if t == nil {
++		return
++	}
++	t.emit("model.load", modelLoad{Phase: "start", Layers: max(layers, 0), Ctx: max(ctx, 0)})
++}
++
++// ModelLoadDone emits model.load phase=done.
++func (t *RequestTracer) ModelLoadDone(layers, ctx int, vramMB float64, d time.Duration) {
++	if t == nil {
++		return
++	}
++	ms := durMS(d)
++	t.emit("model.load", modelLoad{Phase: "done", Layers: max(layers, 0), Ctx: max(ctx, 0), VramMB: math.Max(vramMB, 0), MS: &ms})
++}
++
++// TokenizeDone emits tokenize.done.
++func (t *RequestTracer) TokenizeDone(tokens []Token) {
++	if t == nil {
++		return
++	}
++	if tokens == nil {
++		tokens = []Token{}
++	}
++	t.emit("tokenize.done", tokenizeDone{N: len(tokens), Tokens: tokens})
++}
++
++// Prefill emits one synthesized prefill.batch covering prompt positions
++// [from, to) followed by prefill.done.
++func (t *RequestTracer) Prefill(from, to int, d time.Duration) {
++	if t == nil {
++		return
++	}
++	from, to = max(from, 0), max(to, 0)
++	if to < from {
++		to = from
++	}
++	ms := durMS(d)
++	t.emit("prefill.batch", prefillBatch{BatchI: 0, Of: 1, From: from, To: to, MS: ms})
++	t.emit("prefill.done", prefillDone{NTokens: to - from, MS: ms})
++}
++
++// StepStart begins a decode step and returns its index. In step mode it first
++// blocks until the visualizer acks, the step timeout expires or ctx ends.
++func (t *RequestTracer) StepStart(ctx context.Context, kvUsed, kvTotal int) int {
++	if t == nil {
++		return 0
++	}
++	t.closeStep()
++	next := t.step + 1
++	t.waitStep(ctx, next)
++	t.step = next
++	t.tokenSent = false
++	t.eos = false
++	t.emit("decode.step.start", decodeStepStart{Step: next, KVUsed: max(kvUsed, 0), KVTotal: max(kvTotal, 0)})
++	return next
++}
++
++// closeStep gives a step whose text the response parser held back an empty
++// decode.token so every step has one.
++func (t *RequestTracer) closeStep() {
++	if t.step >= 0 && !t.tokenSent {
++		t.emit("decode.token", decodeToken{Step: t.step, Text: "", IsEOS: false})
++		t.tokenSent = true
++	}
++}
++
++// Logits emits decode.logits. Entropy (nats) is computed over the given
++// candidates, so it is a truncated estimate when only the top-k is known.
++func (t *RequestTracer) Logits(step int, topk []Candidate) {
++	if t == nil {
++		return
++	}
++	if topk == nil {
++		topk = []Candidate{}
++	}
++	var h float64
++	for _, c := range topk {
++		if c.P > 0 {
++			h -= c.P * math.Log(c.P)
++		}
++	}
++	t.emit("decode.logits", decodeLogits{Step: step, TopK: topk, Entropy: round(h, 1e5)})
++}
++
++// Sample emits decode.sample.
++func (t *RequestTracer) Sample(step, chosenID int, temp, topP float64, topK int, method string) {
++	if t == nil {
++		return
++	}
++	t.emit("decode.sample", decodeSample{Step: step, ChosenID: chosenID, Temp: temp, TopP: topP, TopK: topK, Method: method})
++}
++
++// MarkEOS records that the current step sampled end-of-sequence.
++func (t *RequestTracer) MarkEOS() {
++	if t == nil {
++		return
++	}
++	t.eos = true
++}
++
++// Token emits decode.token for text that reached the client in one response
++// chunk (thinking + content), attributed to the current step. done marks the
++// final chunk of the response.
++func (t *RequestTracer) Token(ctx context.Context, text string, done bool) {
++	if t == nil {
++		return
++	}
++	if text == "" && !(done && t.eos && !t.tokenSent) {
++		return
++	}
++	if t.step < 0 {
++		// No llama-server step hooks on this path; still count tokens.
++		t.StepStart(ctx, 0, 0)
++	}
++	isEOS := done && t.eos
++	t.emit("decode.token", decodeToken{Step: t.step, Text: text, IsEOS: isEOS})
++	t.tokenSent = true
++	if t.detail >= Full && text != "" {
++		t.emit("stream.chunk", streamChunk{Step: t.step, Bytes: len(text), UTF8Complete: utf8.ValidString(text), Text: text})
++	}
++}
++
++// Done emits request.done. Only the first terminal event of a request is sent.
++func (t *RequestTracer) Done(s Stats) {
++	if t == nil || !t.finished.CompareAndSwap(false, true) {
++		return
++	}
++	t.closeStep()
++	t.emit("request.done", requestDone{Stats: s})
++}
++
++// Error emits request.error unless a terminal event was already sent.
++func (t *RequestTracer) Error(msg string) {
++	if t == nil || !t.finished.CompareAndSwap(false, true) {
++		return
++	}
++	t.emit("request.error", requestError{Message: msg})
++}
++
++// End releases step mode. If no terminal event was sent, it sends
++// request.done (ok) or request.error so the visualizer never waits forever.
++func (t *RequestTracer) End(ok bool, msg string) {
++	if t == nil {
++		return
++	}
++	if t.ackCh != nil {
++		t.stepping.Store(false)
++		t.e.waiters.CompareAndDelete(t.req, t)
++		t.e.stepOwner.CompareAndSwap(t, nil)
++	}
++	if ok {
++		t.Done(Stats{TotalMS: durMS(time.Since(t.start))})
++	} else {
++		t.Error(msg)
++	}
++}
++
++func (t *RequestTracer) waitStep(ctx context.Context, step int) {
++	if !t.stepping.Load() || !t.e.connected.Load() {
++		return
++	}
++	timer := time.NewTimer(t.e.cfg.stepTimeout)
++	defer timer.Stop()
++	select {
++	case <-t.ackCh:
++	case <-ctx.Done():
++	case <-timer.C:
++		t.emit("step.timeout", stepTimeout{Step: step, Granularity: "token"})
++	}
++}
++
++func (t *RequestTracer) ack(cont bool) {
++	if cont {
++		t.stepping.Store(false)
++	}
++	select {
++	case t.ackCh <- struct{}{}:
++	default:
++	}
++}
++
++func durMS(d time.Duration) float64 { return round(float64(d)/float64(time.Millisecond), 1e3) }
++
++func round(v, scale float64) float64 { return math.Round(v*scale) / scale }
+-- 
+2.47.1.windows.2
+
