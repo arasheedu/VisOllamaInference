@@ -6,7 +6,10 @@ import { join } from 'node:path';
 
 (async () => {
   const userData = mkdtempSync(join(tmpdir(), 'llmviz-pkg-'));
-  writeFileSync(join(userData, 'settings.json'), JSON.stringify({ source: 'mock', detail: 'layers', autosave: false }));
+  writeFileSync(
+    join(userData, 'settings.json'),
+    JSON.stringify({ source: 'mock', detail: 'layers', autosave: false }),
+  );
   const app = await electron.launch({
     executablePath: process.argv[2],
     env: { ...process.env, TRACE_PORT: '4797', VISUALIZER_USER_DATA: userData },
@@ -19,6 +22,8 @@ import { join } from 'node:path';
   await page.selectOption('[data-testid=model]', 'mock-llama:1b');
   await page.click('[data-testid=run]');
   await page.waitForSelector('[data-testid=pipeline][data-phase=done]', { timeout: 60_000 });
-  console.log(JSON.stringify({ hubListening: hub?.listening, port: hub?.port, phase: 'done', errors }));
+  console.log(
+    JSON.stringify({ hubListening: hub?.listening, port: hub?.port, phase: 'done', errors }),
+  );
   await app.close();
 })();

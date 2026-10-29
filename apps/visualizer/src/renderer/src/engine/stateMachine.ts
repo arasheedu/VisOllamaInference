@@ -67,7 +67,16 @@ export function emptyViewModel(): ViewModel {
 }
 
 function emptyStep(step: number): StepDetail {
-  return { step, ops: [], residual: [], attn: [], kvWrites: [], samplingStages: [], layerMs: [] };
+  return {
+    step,
+    ops: [],
+    residual: [],
+    attn: [],
+    kvWrites: [],
+    samplingStages: [],
+    layerMs: [],
+    moe: [],
+  };
 }
 
 /**
@@ -223,7 +232,7 @@ export class InferenceStateMachine {
         break;
       case 'decode.layer':
         this.ensureLayers(e.layer + 1);
-        this.flashLayer(e.layer, e.ms, e.norm, wall, e.step);
+        this.flashLayer(e.layer, e.ms, e.norm, wall, e.step, e.device);
         this.updateStep(e.step, (sd) => ({
           ...sd,
           layerMs: [...sd.layerMs, { layer: e.layer, ms: e.ms }],
@@ -328,6 +337,12 @@ export class InferenceStateMachine {
         this.setPhase('error', e.t_ns);
         this.mark(null, e.t_ns);
         break;
+      case 'decode.moe':
+        this.updateStep(e.step, (sd) => ({
+          ...sd,
+          moe: [...sd.moe, { layer: e.layer, experts: e.experts, wall }],
+        }));
+        break;
       case 'step.timeout':
         break;
     }
@@ -339,11 +354,20 @@ export class InferenceStateMachine {
     norm: number | undefined,
     wall: number,
     step: number,
+    device?: string,
   ) {
     const layers = this.vm.layers.slice();
     for (const l of layers) if (l.active) layers[l.idx] = { ...l, active: false };
     const prev = layers[layer];
-    layers[layer] = { idx: layer, active: true, lastMs: ms, norm: norm ?? prev.norm, wall, step };
+    layers[layer] = {
+      idx: layer,
+      active: true,
+      lastMs: ms,
+      norm: norm ?? prev.norm,
+      wall,
+      step,
+      device: device ?? prev.device,
+    };
     this.vm.layers = layers;
   }
 

@@ -339,6 +339,8 @@ export class Session {
       req: run.req,
       model,
       layers: m.layers,
+      gpuLayers: m.gpuLayers,
+      experts: m.experts,
       prompt,
       responseTokens: 120,
       tokPerSec: this.settings.mockTokPerSec || m.tokPerSec,
@@ -411,7 +413,8 @@ export class Session {
           synth('model.load', { phase: 'done', layers: 0, ctx: 0, vram_mb: 0 });
         }
       }
-      const text = c.message?.content ?? '';
+      // decode.token carries post-parser text: thinking and content, in arrival order
+      const text = (c.message?.thinking ?? '') + (c.message?.content ?? '');
       run.chatText += text;
       if (run.synthetic) {
         if (text) {

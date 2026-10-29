@@ -59,7 +59,9 @@ async function main() {
     case 'replay': {
       const file = pos[0];
       if (!file) throw new Error('usage: replay <file.ndjson> [--speed 1.0] [--loop]');
-      const { events, errors } = parseNdjson(readFileSync(resolve(process.env.INIT_CWD ?? process.cwd(), file), 'utf8'));
+      const { events, errors } = parseNdjson(
+        readFileSync(resolve(process.env.INIT_CWD ?? process.cwd(), file), 'utf8'),
+      );
       if (errors.length) console.error(`[trace-mock] ${errors.length} invalid lines skipped`);
       const hub = new HubClient(url);
       const speed = num(flags.speed, 1)!;

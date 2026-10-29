@@ -6,3 +6,5 @@ ollama
 traces/**/*.ndjson
 pnpm-lock.yaml
 *.md
+llama.cpp
+build-llama

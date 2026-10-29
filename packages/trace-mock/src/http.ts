@@ -109,6 +109,8 @@ export function startMockOllama(o: MockServerOptions = {}) {
           req: reqId,
           model: name,
           layers: m.layers,
+          gpuLayers: m.gpuLayers,
+          experts: m.experts,
           prompt,
           responseTokens: Math.min(
             Number(opts.num_predict) > 0 ? Number(opts.num_predict) : 160,

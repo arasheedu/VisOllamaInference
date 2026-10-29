@@ -43,6 +43,10 @@ export interface GenerateOptions {
   repeatPenalty?: number;
   /** emit per-head decode.attn for this many heads (0 = heads averaged) */
   heads?: number;
+  /** layers [0, gpuLayers) run on CUDA0, the rest on CPU (undefined = no device info) */
+  gpuLayers?: number;
+  /** mixture-of-experts: n experts, k routed per token */
+  experts?: { n: number; k: number };
   /** start of the trace on the emitter's monotonic clock */
   t0Ns?: number;
 }
@@ -205,7 +209,9 @@ export function generateTrace(o: GenerateOptions = {}): GeneratedTrace {
     let norm = 4 + r();
     for (let l = 0; l < opt.layers; l++) {
       gate('layer', step);
-      const thisLayerMs = jitter(layerMs, 0.2) * (l === 0 || l === opt.layers - 1 ? 1.3 : 1);
+      const cpuLayer = o.gpuLayers !== undefined && l >= o.gpuLayers;
+      const thisLayerMs =
+        jitter(layerMs, 0.2) * (l === 0 || l === opt.layers - 1 ? 1.3 : 1) * (cpuLayer ? 4 : 1);
       if (opt.detail === 'full') {
         for (const { op, w } of OP_SEQUENCE) {
           const opMs = thisLayerMs * w;
@@ -232,8 +238,27 @@ export function generateTrace(o: GenerateOptions = {}): GeneratedTrace {
       const delta = Math.abs(1.1 + gaussian(r) * 0.35) * (l > opt.layers * 0.85 ? 1.8 : 1);
       norm += delta;
       emit('decode.residual', { step, layer: l, norm: round3(norm), delta_norm: round3(delta) });
+      if (o.experts) {
+        const picked = new Set<number>();
+        while (picked.size < o.experts.k) picked.add(Math.floor(r() * o.experts.n));
+        const ws = [...picked].map(() => r() + 0.2);
+        const tot = ws.reduce((a, b) => a + b, 0);
+        emit('decode.moe', {
+          step,
+          layer: l,
+          experts: [...picked]
+            .map((id, i) => ({ id, w: round3(ws[i] / tot) }))
+            .sort((a, b) => b.w - a.w),
+        });
+      }
       if (emitLayers)
-        emit('decode.layer', { step, layer: l, ms: round3(thisLayerMs), norm: round3(norm) });
+        emit('decode.layer', {
+          step,
+          layer: l,
+          ms: round3(thisLayerMs),
+          norm: round3(norm),
+          ...(o.gpuLayers !== undefined ? { device: l < o.gpuLayers ? 'CUDA0' : 'CPU' } : {}),
+        });
     }
 
     // ---- sampling ----

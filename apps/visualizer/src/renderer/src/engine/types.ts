@@ -35,6 +35,8 @@ export interface LayerState {
   /** wall time of the last activation (for flash/fade), -Infinity if never */
   wall: number;
   step: number;
+  /** backend that ran it ("CPU", "CUDA0", …) when the runner reports it */
+  device?: string;
 }
 
 export interface OpState {
@@ -61,6 +63,8 @@ export interface StepDetail {
   kvWrites: Array<{ layer: number; pos: number; wall: number }>;
   samplingStages: Array<SampleStageEvent & { wall: number }>;
   layerMs: Array<{ layer: number; ms: number }>;
+  /** MoE routing per layer (MoE models only) */
+  moe: Array<{ layer: number; experts: Array<{ id: number; w: number }>; wall: number }>;
   stepMs?: number;
 }
 

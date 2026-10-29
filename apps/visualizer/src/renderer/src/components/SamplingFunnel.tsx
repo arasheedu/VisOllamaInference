@@ -12,7 +12,7 @@ const W = 340;
 const H_FULL = 92;
 const H_COMPACT = 22;
 
-const STAGE_LABEL: Record<SampleStage, string> = {
+const STAGE_LABEL: Record<string, string> = {
   raw: 'raw logits',
   rep_penalty: 'repetition penalty',
   temperature: 'temperature',
@@ -21,7 +21,12 @@ const STAGE_LABEL: Record<SampleStage, string> = {
   min_p: 'min-p',
   softmax: 'softmax',
   draw: 'draw',
+  dry: 'DRY (repetition)',
+  typical_p: 'typical-p',
+  xtc: 'XTC',
+  top_n_sigma: 'top-n-σ',
 };
+const labelOf = (s: string) => STAGE_LABEL[s] ?? s;
 
 type Cand = { id: number; v: number };
 
@@ -82,6 +87,10 @@ export function SamplingFunnel() {
   const P = topP || Number(options.top_p) || 0;
 
   const stages = detail?.samplingStages ?? [];
+  const noStages = useUi((s) => s.vm.capabilities.includes('no_sample_stages'));
+  const prevStages = useUi((s) =>
+    detail ? s.vm.steps[detail.step - 1]?.samplingStages : undefined,
+  );
   const byStage = new Map<SampleStage, SampleStageEvent>();
   for (const s of stages) byStage.set(s.stage, s);
   const current = stages.length ? stages[stages.length - 1].stage : null;
@@ -97,11 +106,25 @@ export function SamplingFunnel() {
   if (!detail || !stages.length) {
     return (
       <div className="funnel" style={{ color: 'var(--muted)', padding: 12 }}>
-        Waiting for sampler stages… (Full detail)
+        {noStages
+          ? 'This runner does not report sampler stages (stock llama-server). Build Ollama with the llama.cpp trace patch for the full sampling chain; top-k probabilities are in Basic/Layers view.'
+          : 'Waiting for sampler stages… (Full detail)'}
       </div>
     );
   }
   const trans = rm ? { duration: 0 } : SPRING;
+  // Real runners (llama.cpp) use their own chain order, e.g. temperature after
+  // the cut-offs: show stages in arrival order. Pending stages come from the
+  // previous step's chain; known stages the runner never runs are greyed.
+  const arrived = stages.map((x) => x.stage);
+  const template = prevStages?.length ? prevStages.map((x) => x.stage) : [...SAMPLE_STAGES];
+  const order = [
+    ...arrived,
+    ...template.filter((n) => !arrived.includes(n)),
+    ...(prevStages?.length
+      ? SAMPLE_STAGES.filter((n) => !template.includes(n) && !arrived.includes(n))
+      : []),
+  ];
   const raw = byStage.get('raw');
 
   return (
@@ -116,10 +139,10 @@ export function SamplingFunnel() {
       >
         step {step}
       </div>
-      {SAMPLE_STAGES.map((name, idx) => {
+      {order.map((name, idx) => {
         const ev = byStage.get(name);
-        // a stage not (yet) seen: absent if a later stage exists, otherwise pending
-        const laterSeen = SAMPLE_STAGES.slice(idx + 1).some((s) => byStage.has(s));
+        // not seen yet: pending if the runner's chain has it, else not configured
+        const laterSeen = !template.includes(name);
         if (!ev) {
           return (
             <div
@@ -128,14 +151,15 @@ export function SamplingFunnel() {
               style={laterSeen ? undefined : { opacity: 0.5 }}
             >
               <header>
-                <span>{STAGE_LABEL[name]}</span>
+                <span>{labelOf(name)}</span>
                 <span>{laterSeen ? 'not configured' : '…'}</span>
               </header>
             </div>
           );
         }
         const isCur = name === current;
-        const prevIdx = SAMPLE_STAGES.slice(0, idx)
+        const prevIdx = order
+          .slice(0, idx)
           .reverse()
           .find((s) => byStage.has(s));
         const prev = prevIdx ? byStage.get(prevIdx) : undefined;
@@ -147,7 +171,7 @@ export function SamplingFunnel() {
                 setUi({ inspector: { kind: 'stage', step, stage: name } });
               }}
             >
-              <span>{STAGE_LABEL[name]}</span>
+              <span>{labelOf(name)}</span>
               <span>{summary(ev, T, P)}</span>
             </header>
             <StageBody

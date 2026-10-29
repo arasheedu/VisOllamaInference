@@ -141,6 +141,11 @@ export function LayerCanvas() {
               const a = 1 - age / flashMs;
               g.rect(PAD_L, y, rw, hh).fill({ color, alpha: 0.85 * a * a });
             }
+            if (l.device) {
+              // device tick: GPU cyan, CPU orange (partial offload is visible at a glance)
+              const gpu = !/^cpu/i.test(l.device);
+              g.rect(PAD_L - 4, y, 3, hh).fill({ color: gpu ? 0x22d3ee : 0xf97316, alpha: 0.9 });
+            }
             if (i === sweepIdx)
               g.rect(PAD_L, y, rw, hh).fill({ color: PHASE_HEX.prefill, alpha: 0.5 });
           }
@@ -239,6 +244,7 @@ export function LayerCanvas() {
           <div className="mono">layer {hover.layer}</div>
           <div className="mono">last {l && l.lastMs > 0 ? `${l.lastMs.toFixed(3)} ms` : '–'}</div>
           <div className="mono">norm {l && l.norm > 0 ? l.norm.toFixed(2) : '–'}</div>
+          {l?.device && <div className="mono">device {l.device}</div>}
           <div className="mono" style={{ color: 'var(--muted)' }}>
             step {l?.step ?? '–'} · click to inspect
           </div>

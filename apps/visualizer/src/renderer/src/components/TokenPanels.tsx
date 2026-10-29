@@ -210,8 +210,8 @@ export function ResponseStream() {
           data-text={responseText}
           style={{ flex: 1 }}
         >
-          {tokens.map((t) => (
-            <TokenSpan key={t.step} t={t} onHover={onHover} onLeave={() => setTip(null)} />
+          {tokens.map((t, i) => (
+            <TokenSpan key={i} t={t} onHover={onHover} onLeave={() => setTip(null)} />
           ))}
           {phase === 'decoding' && <span className="caret" />}
         </div>

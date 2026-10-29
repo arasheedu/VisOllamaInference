@@ -60,7 +60,8 @@ for (const opt of TraceEvent.options) {
   const fields = Object.entries(js.properties ?? {}).filter(([k]) => !BASE.has(k));
   if (fields.length) {
     md += '| field | type | required |\n|---|---|---|\n';
-    for (const [k, v] of fields) md += `| \`${k}\` | \`${typeOf(v)}\` | ${req.has(k) ? 'yes' : 'no'} |\n`;
+    for (const [k, v] of fields)
+      md += `| \`${k}\` | \`${typeOf(v)}\` | ${req.has(k) ? 'yes' : 'no'} |\n`;
   } else md += '_No payload._\n';
   md += '\n';
 }

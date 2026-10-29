@@ -91,11 +91,26 @@ export function promptText(nTokens: number): string {
   return text;
 }
 
-export const MOCK_MODELS: Record<
-  string,
-  { layers: number; params: string; tokPerSec: number; size: number }
-> = {
+export interface MockModel {
+  layers: number;
+  params: string;
+  tokPerSec: number;
+  size: number;
+  gpuLayers?: number;
+  experts?: { n: number; k: number };
+}
+
+export const MOCK_MODELS: Record<string, MockModel> = {
   'mock-llama:1b': { layers: 16, params: '1.2B', tokPerSec: 120, size: 800e6 },
   'mock-llama:8b': { layers: 32, params: '8.0B', tokPerSec: 60, size: 4.9e9 },
-  'mock-llama:70b': { layers: 80, params: '70.6B', tokPerSec: 12, size: 42e9 },
+  // partially offloaded: 60 layers on GPU, 20 on CPU
+  'mock-llama:70b': { layers: 80, params: '70.6B', tokPerSec: 12, size: 42e9, gpuLayers: 60 },
+  'mock-moe:30b-a3b': {
+    layers: 48,
+    params: '30.5B (3.3B active)',
+    tokPerSec: 45,
+    size: 18e9,
+    gpuLayers: 48,
+    experts: { n: 128, k: 8 },
+  },
 };

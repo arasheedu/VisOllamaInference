@@ -195,6 +195,13 @@ export class PlaybackClock {
     const tpBefore = this.tp;
     const frameStart = now - dt;
     let target = this.tp + dt * 1e6 * this.speed;
+    // While stepping, trace-time gaps are mostly the runner idling at a
+    // step-mode gate (waiting for the user): skip them. Only the minimum
+    // on-screen durations (holds) pace a step.
+    if (this.stopWhen) {
+      const next = src.peek();
+      if (next && next.t_ns > target) target = next.t_ns;
+    }
     let consumed = 0;
     for (;;) {
       const e = src.peek();
@@ -208,7 +215,10 @@ export class PlaybackClock {
         }
         break;
       }
-      if (e.t_ns > target) break;
+      if (e.t_ns > target) {
+        if (!this.stopWhen) break;
+        target = e.t_ns; // stepping: jump over idle gaps
+      }
       const until = Math.max(
         this.subHoldUntil,
         BOUNDARY.has(e.type) ? this.stageHoldUntil : -Infinity,

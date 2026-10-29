@@ -43,7 +43,10 @@ export const SAMPLE_STAGES = [
   'softmax',
   'draw',
 ] as const;
-export type SampleStage = (typeof SAMPLE_STAGES)[number];
+/** Extra llama.cpp sampler names (real chains); any other string is also accepted. */
+export const EXTRA_SAMPLE_STAGES = ['dry', 'typical_p', 'xtc', 'top_n_sigma'] as const;
+export type SampleStage =
+  (typeof SAMPLE_STAGES)[number] | (typeof EXTRA_SAMPLE_STAGES)[number] | (string & {});
 
 const ev = <T extends string, S extends z.ZodRawShape>(type: T, shape: S) =>
   z.object({ ...base, type: z.literal(type), ...shape });
@@ -88,6 +91,8 @@ export const DecodeLayer = ev('decode.layer', {
   layer: z.number().int().nonnegative(),
   ms: z.number().nonnegative(),
   norm: z.number().optional(),
+  /** backend that ran the layer, e.g. "CPU", "CUDA0" */
+  device: z.string().optional(),
 });
 export const DecodeLogits = ev('decode.logits', {
   step: z.number().int().nonnegative(),
@@ -157,7 +162,8 @@ export const DecodeKvWrite = ev('decode.kv.write', {
 });
 export const DecodeSampleStage = ev('decode.sample.stage', {
   step: z.number().int().nonnegative(),
-  stage: z.enum(SAMPLE_STAGES),
+  /** stages arrive in the runner's real chain order; unknown names allowed */
+  stage: z.string().min(1),
   candidates: z.array(z.object({ id: z.number().int(), v: z.number() })),
   cutoff: z.number().optional(),
   draw: z.number().optional(),
@@ -167,6 +173,12 @@ export const StreamChunk = ev('stream.chunk', {
   bytes: z.number().int().nonnegative(),
   utf8_complete: z.boolean(),
   text: z.string(),
+});
+/** Mixture-of-experts routing for one layer (MoE models only). */
+export const DecodeMoe = ev('decode.moe', {
+  step: z.number().int().nonnegative(),
+  layer: z.number().int().nonnegative(),
+  experts: z.array(z.object({ id: z.number().int().nonnegative(), w: z.number() })),
 });
 /** Emitted by the runner when a step-mode wait expired without an ack. */
 export const StepTimeout = ev('step.timeout', {
@@ -196,6 +208,7 @@ export const TraceEvent = z.discriminatedUnion('type', [
   DecodeSampleStage,
   StreamChunk,
   StepTimeout,
+  DecodeMoe,
 ]);
 export type TraceEvent = z.infer<typeof TraceEvent>;
 export type EventType = TraceEvent['type'];
@@ -228,6 +241,7 @@ export const PRIORITY: Record<EventType, Priority> = {
   'decode.sample.stage': 'critical',
   'stream.chunk': 'droppable',
   'step.timeout': 'critical',
+  'decode.moe': 'droppable',
 };
 
 /** Minimum detail level at which each event type is emitted / consumed. */
@@ -253,6 +267,7 @@ export const EVENT_DETAIL: Record<EventType, DetailLevel> = {
   'decode.sample.stage': 'full',
   'stream.chunk': 'full',
   'step.timeout': 'basic',
+  'decode.moe': 'full',
 };
 
 export const detailRank = (d: DetailLevel): number => DETAIL_LEVELS.indexOf(d);

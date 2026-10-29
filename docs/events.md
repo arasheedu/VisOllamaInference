@@ -86,6 +86,7 @@ priority **droppable** · detail ≥ **layers**
 | `layer` | `int` | yes |
 | `ms` | `number` | yes |
 | `norm` | `number` | no |
+| `device` | `string` | no |
 
 ## `decode.logits`
 
@@ -207,7 +208,7 @@ priority **critical** · detail ≥ **full**
 | field | type | required |
 |---|---|---|
 | `step` | `int` | yes |
-| `stage` | `"raw" \| "rep_penalty" \| "temperature" \| "top_k" \| "top_p" \| "min_p" \| "softmax" \| "draw"` | yes |
+| `stage` | `string` | yes |
 | `candidates` | `Array<{ id: int, v: number }>` | yes |
 | `cutoff` | `number` | no |
 | `draw` | `number` | no |
@@ -231,6 +232,16 @@ priority **critical** · detail ≥ **basic**
 |---|---|---|
 | `step` | `int` | yes |
 | `granularity` | `"token" \| "layer" \| "sample"` | yes |
+
+## `decode.moe`
+
+priority **droppable** · detail ≥ **full**
+
+| field | type | required |
+|---|---|---|
+| `step` | `int` | yes |
+| `layer` | `int` | yes |
+| `experts` | `Array<{ id: int, w: number }>` | yes |
 
 ## Control: `ack` (app → producer)
 

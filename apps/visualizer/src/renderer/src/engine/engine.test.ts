@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseNdjson, type TraceEvent } from 'trace-schema';
@@ -242,4 +242,20 @@ describe('engine: seek and step', () => {
     r = runUntilPaused(p, r.now + FRAME);
     expect(r.vm.steps[0].samplingStages.length).toBe(2);
   });
+});
+
+describe('engine: real Ollama traces (traces/real)', () => {
+  const dir = resolve(__dirname, '../../../../../../traces/real');
+  const files = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.ndjson')) : [];
+  for (const f of files) {
+    it(`${f}: plays to done; text equals the /api/chat response`, () => {
+      const { events, errors } = parseNdjson(readFileSync(resolve(dir, f), 'utf8'));
+      expect(errors).toEqual([]);
+      const r = simulate(events, { detail: 'full' });
+      expect(r.vm.phase).toBe('done');
+      expect(r.vm.capabilities).toContain('no_layers');
+      const resp = resolve(dir, f.replace('.ndjson', '.response.txt'));
+      if (existsSync(resp)) expect(r.vm.responseText).toBe(readFileSync(resp, 'utf8'));
+    });
+  }
 });

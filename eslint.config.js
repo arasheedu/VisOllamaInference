@@ -10,7 +10,7 @@ export default tseslint.config(
       '**/out/**',
       '**/dist/**',
       '**/release/**',
-      'ollama/**',
+      'ollama/**', 'llama.cpp/**', 'build-llama/**',
       '**/test-results/**',
       '**/playwright-report/**',
     ],

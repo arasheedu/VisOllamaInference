@@ -9,6 +9,7 @@ import { Timeline } from './components/Timeline';
 import { DebugPanel, Inspector, SettingsModal, Tour, Warnings } from './components/Overlays';
 import { LayerCanvas } from './viz/LayerCanvas';
 import { ForwardPass } from './viz/ForwardPass';
+import { MoePanel } from './components/MoePanel';
 import { setUi, useUi } from './store';
 import { useReducedMotion } from './theme';
 import { dilationLabel } from './components/Timeline';
@@ -76,6 +77,7 @@ export function App() {
             <div className="panel-body">
               {detail === 'full' ? <ForwardPass /> : <LayerCanvas />}
               <CenterBadges />
+              {detail === 'full' && <MoePanel />}
             </div>
           </div>
           <div className="panel">
