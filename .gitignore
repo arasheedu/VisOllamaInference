@@ -7,5 +7,5 @@ release/
 test-results/
 playwright-report/
 ollama/
-llama.cpp/
-build-llama/
+/llama.cpp/
+/build-*/

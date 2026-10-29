@@ -1,0 +1,209 @@
+From 5cdcbf45da8d37b9ab9fe41dcd44c87d70d65ccc Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 16:00:08 -0700
+Subject: [PATCH 6/6] server: cheaper full-detail tracing, layer device from
+ its weights
+
+[visualizer-trace] skip observing no-op view nodes (fewer GPU syncs), read
+q / kq_soft_max for all heads in one transfer, keep the top-n admission
+threshold in a local, and report decode.layer.device from the buffer of
+the layer's weight matmuls (the scheduler can put the residual add of a
+CPU layer on the GPU with partial offload).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ tools/server/server-trace.cpp | 76 ++++++++++++++++++++++++++---------
+ tools/server/server-trace.h   |  1 +
+ 2 files changed, 59 insertions(+), 18 deletions(-)
+
+diff --git a/tools/server/server-trace.cpp b/tools/server/server-trace.cpp
+index fb94476de..d6c204c6b 100644
+--- a/tools/server/server-trace.cpp
++++ b/tools/server/server-trace.cpp
+@@ -101,8 +101,9 @@ static const char * trace_device(const ggml_tensor * t) {
+     return dev ? ggml_backend_dev_name(dev) : "CPU";
+ }
+ 
+-// row i1 (dim 1) of a tensor with contiguous rows, converted to f32
+-static bool trace_read_row(const ggml_tensor * t, int64_t i1, int64_t i2, std::vector<float> & out) {
++// row i1 (dim 1) of a tensor with contiguous rows, converted to f32; host = the whole tensor span
++// already copied with trace_read_all() (one transfer for many rows), or nullptr to read the row
++static bool trace_read_row(const ggml_tensor * t, int64_t i1, int64_t i2, std::vector<float> & out, const uint8_t * host = nullptr) {
+     const int64_t n = t->ne[0];
+     const size_t  rs = ggml_row_size(t->type, n);
+     const size_t  off = i1*t->nb[1] + i2*t->nb[2];
+@@ -110,20 +111,35 @@ static bool trace_read_row(const ggml_tensor * t, int64_t i1, int64_t i2, std::v
+         return false;
+     }
+     out.resize(n);
+-    if (t->type == GGML_TYPE_F32) {
+-        ggml_backend_tensor_get(t, out.data(), off, rs);
+-        return true;
+-    }
+     const auto * tt = ggml_get_type_traits(t->type);
+-    if (!tt->to_float) {
++    if (t->type != GGML_TYPE_F32 && !tt->to_float) {
+         return false;
+     }
+-    std::vector<uint8_t> tmp(rs);
+-    ggml_backend_tensor_get(t, tmp.data(), off, rs);
+-    tt->to_float(tmp.data(), out.data(), n);
++    std::vector<uint8_t> tmp;
++    const uint8_t * src = host ? host + off : nullptr;
++    if (!src) {
++        tmp.resize(rs);
++        ggml_backend_tensor_get(t, tmp.data(), off, rs);
++        src = tmp.data();
++    }
++    if (t->type == GGML_TYPE_F32) {
++        memcpy(out.data(), src, rs);
++    } else {
++        tt->to_float(src, out.data(), n);
++    }
+     return true;
+ }
+ 
++static void trace_read_all(const ggml_tensor * t, std::vector<uint8_t> & buf) {
++    buf.resize(ggml_nbytes(t));
++    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
++}
++
++// no-op view nodes: observing them only adds a sync, their (zero) time merges into the next segment
++static bool trace_is_view(const ggml_tensor * t) {
++    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
++}
++
+ static float trace_l2(const float * a, const float * b, size_t n) {
+     double s = 0.0;
+     for (size_t i = 0; i < n; ++i) {
+@@ -139,17 +155,23 @@ static json trace_top_candidates(const llama_token_data_array * cur_p, int n, bo
+     auto val = [&](const llama_token_data & d) { return use_p ? d.p : d.logit; };
+     using item = std::pair<float, int32_t>; // value, index
+     std::priority_queue<item, std::vector<item>, std::greater<item>> heap; // min-heap of the best n
++    // hot loop over the full vocab for the raw stage: keep the admission threshold in a local
++    float thr = -INFINITY;
+     for (size_t i = 0; i < cur_p->size; ++i) {
+         const float v = val(cur_p->data[i]);
+-        if (std::isinf(v) && v < 0) {
++        if (v == -INFINITY) {
+             continue;
+         }
+         n_alive++;
+         if ((int) heap.size() < n) {
+             heap.push({ v, (int32_t) i });
+-        } else if (n > 0 && v > heap.top().first) {
++            if ((int) heap.size() == n) {
++                thr = heap.top().first;
++            }
++        } else if (v > thr && n > 0) {
+             heap.pop();
+             heap.push({ v, (int32_t) i });
++            thr = heap.top().first;
+         }
+     }
+     std::vector<item> best;
+@@ -454,6 +476,7 @@ void server_trace::before_decode(llama_context * ctx, bool prefill, int32_t step
+     this->pos     = pos_last;
+     cur_layer = -1;
+     in_ub     = false;
++    layer_dev = nullptr;
+     t_last    = trace_now_ns();
+     t_layer   = t_last;
+     std::fill(std::begin(ops), std::end(ops), 0.0);
+@@ -513,7 +536,12 @@ bool server_trace::want(const ggml_tensor * t, const char * b, int il) const {
+     if (il < 0) {
+         return strcmp(b, "embd") == 0; // layer 0 input, for its residual delta
+     }
+-    return trace_op_of(t, b) >= 0 || strcmp(b, "ffn_moe_topk") == 0 || trace_is_moe_weights(b);
++    if (strcmp(b, "ffn_moe_topk") == 0 || trace_is_moe_weights(b)) {
++        return true; // read back (ffn_moe_topk is a view of the argsort)
++    }
++    // op boundaries; views (e.g. the pre-RoPE Qcur/Kcur/Vcur reshapes, kqv_out with FA) are skipped,
++    // their segment is charged to the next observed node, which in llama-family graphs has the same op
++    return trace_op_of(t, b) >= 0 && !trace_is_view(t);
+ }
+ 
+ bool server_trace::eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+@@ -546,6 +574,12 @@ bool server_trace::eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+                 tr->ub_ntok = (int32_t) t->ne[1];
+             }
+         }
++        // the layer runs where its weights are: the first weight matmul of the layer decides (the
++        // scheduler may still put weight-less ops such as the residual add on a neighbouring GPU)
++        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && !tr->layer_dev && tr->cur_layer >= 0 &&
++                t->src[0] && t->src[0]->buffer && ggml_backend_buffer_get_usage(t->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++            tr->layer_dev = trace_device(t->src[0]);
++        }
+         if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+             tr->attn = ATTN_FLASH;
+         } else if (strcmp(base, "kq_soft_max") == 0) {
+@@ -582,7 +616,8 @@ void server_trace::on_observed(ggml_tensor * t, const char * b, int il) {
+             ev["ms"]      = ns_to_ms(now - t_layer);
+             emit(std::move(ev));
+         }
+-        t_layer = now;
++        t_layer   = now;
++        layer_dev = nullptr;
+         if (il == n_layer - 1) {
+             in_ub = false;
+             json ev = trace_ev("prefill.batch");
+@@ -644,7 +679,8 @@ void server_trace::on_observed(ggml_tensor * t, const char * b, int il) {
+     ev["step"]   = step;
+     ev["layer"]  = il;
+     ev["ms"]     = ns_to_ms(now - t_layer);
+-    ev["device"] = trace_device(t);
++    ev["device"] = layer_dev ? layer_dev : trace_device(t);
++    layer_dev    = nullptr;
+     t_layer = now;
+ 
+     if (full) {
+@@ -671,7 +707,7 @@ void server_trace::on_observed(ggml_tensor * t, const char * b, int il) {
+                 oe["step"]  = step;
+                 oe["layer"] = il;
+                 oe["op"]    = OP_NAMES[o];
+-                oe["ms"]    = ops[o];
++                oe["ms"]    = std::round(ops[o]*1e4)/1e4;
+                 emit(std::move(oe));
+             }
+         }
+@@ -712,9 +748,11 @@ void server_trace::attn_softmax(ggml_tensor * t, int il) {
+     }
+     const int64_t n_kv = t->ne[0], n_head = t->ne[2], tok = t->ne[1] - 1;
+     std::vector<float> avg(n_kv, 0.0f), row;
++    std::vector<uint8_t> host;
++    trace_read_all(t, host); // one transfer for all heads
+     std::vector<std::vector<float>> heads;
+     for (int64_t h = 0; h < n_head; ++h) {
+-        if (!trace_read_row(t, tok, h, row)) {
++        if (!trace_read_row(t, tok, h, row, host.data())) {
+             return;
+         }
+         for (int64_t j = 0; j < n_kv; ++j) {
+@@ -766,9 +804,11 @@ void server_trace::attn_flash(ggml_tensor * t, int il) {
+     }
+ 
+     std::vector<float> qrow, krow(d), s(n_kv), avg(n_kv, 0.0f);
++    std::vector<uint8_t> qbuf;
++    trace_read_all(q, qbuf); // one transfer for all heads
+     std::vector<std::vector<float>> heads;
+     for (int64_t h = 0; h < n_head; ++h) {
+-        if (!trace_read_row(q, tok, h, qrow)) {
++        if (!trace_read_row(q, tok, h, qrow, qbuf.data())) {
+             return;
+         }
+         const int64_t g = h / (n_head / n_head_kv);
+diff --git a/tools/server/server-trace.h b/tools/server/server-trace.h
+index cfd73eb3a..0a3024bef 100644
+--- a/tools/server/server-trace.h
++++ b/tools/server/server-trace.h
+@@ -115,6 +115,7 @@ private:
+     int64_t t_layer  = 0;   // start of the current layer
+     int64_t t_ub     = 0;   // start of the current ubatch
+     double  ops[7]   = {};  // per-op ms in the current layer
++    const char * layer_dev = nullptr; // device of the current layer's weights
+ 
+     // prefill
+     int32_t ub_i       = -1;
+-- 
+2.47.1.windows.2
+

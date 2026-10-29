@@ -1,0 +1,166 @@
+From 6dc2239e495053ff7e8d31c7bc285ecd00aca77a Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 15:38:25 -0700
+Subject: [PATCH 4/6] server: leave trace step mode when the client disconnects
+
+[visualizer-trace] step-mode waits poll server_response::is_waiting() every
+250 ms, so a dropped client releases the slot loop at once. Sample-stage
+pauses report the real step.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ tools/server/server-context.cpp |  3 ++-
+ tools/server/server-queue.cpp   |  6 +++++
+ tools/server/server-queue.h     |  3 +++
+ tools/server/server-trace.cpp   | 40 ++++++++++++++++++++++++++++-----
+ tools/server/server-trace.h     |  5 ++++-
+ 5 files changed, 50 insertions(+), 7 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 21bc5b01c..678ea7979 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2109,7 +2109,8 @@ private:
+ 
+         // [visualizer-trace] per-request collector; in stream mode, step mode flushes events with trace-only chunks
+         slot.trace.start(slot.task->params.trace, slot.id, ctx_tgt, slot.task->params.stream
+-            ? std::function<void()>([this, &slot]() { send_trace_chunk(slot); }) : std::function<void()>());
++            ? std::function<void()>([this, &slot]() { send_trace_chunk(slot); }) : std::function<void()>(),
++            [this, id_task = slot.task->id]() { return queue_results.is_waiting(id_task); });
+ 
+         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
+             slot.state = SLOT_STATE_PROCESSING_PROMPT;
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+index c4ce90721..1cc60a339 100644
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -620,3 +620,9 @@ void server_response_reader::stop() {
+         SRV_DBG("%s", "all tasks already finished, no need to cancel\n");
+     }
+ }
++
++// [visualizer-trace]
++bool server_response::is_waiting(int id_task) {
++    std::unique_lock<std::mutex> lock(mutex_results);
++    return waiting_task_ids.count(id_task) > 0;
++}
+diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
+index 692255e4f..34e7db119 100644
+--- a/tools/server/server-queue.h
++++ b/tools/server/server-queue.h
+@@ -176,6 +176,9 @@ public:
+     // remove multiple tasks from waiting list
+     void remove_waiting_task_ids(const std::unordered_set<int> & id_tasks);
+ 
++    // [visualizer-trace] whether a client still waits for results of id_task
++    bool is_waiting(int id_task);
++
+     // This function blocks the thread until there is a response for one of the id_tasks
+     server_task_result_ptr recv(const std::unordered_set<int> & id_tasks);
+ 
+diff --git a/tools/server/server-trace.cpp b/tools/server/server-trace.cpp
+index 9671fd161..15a6f6500 100644
+--- a/tools/server/server-trace.cpp
++++ b/tools/server/server-trace.cpp
+@@ -299,7 +299,7 @@ void server_trace_payload::attach(json & res) const {
+ 
+ static server_trace * g_installed = nullptr; // collector the eval callback currently points to
+ 
+-void server_trace::start(const server_trace_params & params, int32_t id_slot, llama_context * ctx, std::function<void()> flush_fn) {
++void server_trace::start(const server_trace_params & params, int32_t id_slot, llama_context * ctx, std::function<void()> flush_fn, std::function<bool()> alive_fn) {
+     stop();
+     p = params;
+     if (!p.enabled()) {
+@@ -307,6 +307,7 @@ void server_trace::start(const server_trace_params & params, int32_t id_slot, ll
+     }
+     this->id_slot  = id_slot;
+     this->flush_fn = std::move(flush_fn);
++    this->alive_fn = std::move(alive_fn);
+     n_layer = llama_model_n_layer(llama_get_model(ctx));
+     {
+         events    = json::array();
+@@ -346,6 +347,7 @@ void server_trace::stop() {
+     }
+     p = server_trace_params();
+     flush_fn = nullptr;
++    alive_fn = nullptr;
+ }
+ 
+ void server_trace::emit(json && ev) {
+@@ -382,6 +384,12 @@ void server_trace::wait_step(const char * granularity) {
+     if (!step_own) {
+         return;
+     }
++    {
++        std::lock_guard<std::mutex> lock(g_step.m);
++        if (g_step.cont) {
++            return; // the client left step mode: run freely, events ride on the token chunks again
++        }
++    }
+     if (flush_fn) {
+         flush_fn();
+     }
+@@ -391,11 +399,33 @@ void server_trace::wait_step(const char * granularity) {
+     }
+     g_step.waiting        = true;
+     g_step.at_granularity = granularity;
+-    g_step.at_step        = prefill ? 0 : (strcmp(granularity, "sample") == 0 ? sample_step : step);
++    g_step.at_step        = strcmp(granularity, "sample") == 0 ? sample_step : step;
+     g_step.at_layer       = strcmp(granularity, "layer") == 0 ? cur_layer : -1;
+-    const bool ok = g_step.cv.wait_for(lock, std::chrono::milliseconds(p.step_timeout_ms), [] {
+-        return g_step.acks > 0 || g_step.cont || g_step.owner < 0;
+-    });
++    // wait in slices so a client that went away (its HTTP handler stopped waiting for results)
++    // releases the server at once instead of after every remaining timeout
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(p.step_timeout_ms);
++    bool ok = false;
++    for (;;) {
++        const auto left  = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
++        const auto slice = std::min(left, std::chrono::milliseconds(250));
++        if (g_step.cv.wait_for(lock, std::max(slice, std::chrono::milliseconds(0)), [] {
++                return g_step.acks > 0 || g_step.cont || g_step.owner < 0;
++            })) {
++            ok = true;
++            break;
++        }
++        if (std::chrono::steady_clock::now() >= deadline) {
++            break;
++        }
++        lock.unlock();
++        const bool alive = !alive_fn || alive_fn();
++        lock.lock();
++        if (!alive) {
++            g_step.cont = true; // leave step mode for the rest of this request
++            ok = true;
++            break;
++        }
++    }
+     g_step.waiting = false;
+     g_step.at_stage.clear();
+     if (g_step.acks > 0) {
+diff --git a/tools/server/server-trace.h b/tools/server/server-trace.h
+index 484113f7c..cfd73eb3a 100644
+--- a/tools/server/server-trace.h
++++ b/tools/server/server-trace.h
+@@ -67,7 +67,9 @@ struct server_trace {
+     server_trace_params p;
+ 
+     // request lifecycle (main thread)
+-    void start(const server_trace_params & params, int32_t id_slot, llama_context * ctx, std::function<void()> flush_fn);
++    // flush_fn: sends a trace-only chunk (may be empty); alive_fn: false once the client is gone
++    void start(const server_trace_params & params, int32_t id_slot, llama_context * ctx,
++               std::function<void()> flush_fn, std::function<bool()> alive_fn);
+     void stop();
+     bool active() const { return p.enabled(); }
+ 
+@@ -94,6 +96,7 @@ private:
+     bool caps_sent = false;
+ 
+     std::function<void()> flush_fn; // sends a trace-only chunk (stream + step mode)
++    std::function<bool()> alive_fn; // client still connected
+     int32_t id_slot  = -1;
+     int32_t n_layer  = 0;
+     bool    step_own = false; // holds the global step gate
+-- 
+2.47.1.windows.2
+

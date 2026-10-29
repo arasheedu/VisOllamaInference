@@ -1,0 +1,140 @@
+From 3ca62108b747bd3128386484a063f51e44ab3aab Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 15:21:55 -0700
+Subject: [PATCH 2/6] common: optional per-stage observer for
+ common_sampler_sample
+
+[visualizer-trace] common_sampler_set_stage_cb() applies the chain one
+sampler at a time and reports the candidate array before/after each one,
+plus the raw logits and the reasoning-budget/grammar stages. Without an
+observer the chain is applied as before.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ common/sampling.cpp | 52 +++++++++++++++++++++++++++++++++++++++++++--
+ common/sampling.h   | 12 +++++++++++
+ 2 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 564fa9c4d..37de4d614 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -125,6 +125,35 @@ struct common_sampler {
+     // for rejection sampling; independent of the draft, or the target distribution is not preserved
+     std::mt19937 rng;
+ 
++    // [visualizer-trace] stage observer, see common_sampler_set_stage_cb()
++    common_sampler_stage_cb stage_cb    = nullptr;
++    void *                  stage_cb_ud = nullptr;
++
++    void stage(const char * name, bool pre = false, llama_sampler * smpl = nullptr) const {
++        if (stage_cb) {
++            stage_cb(smpl, name, &cur_p, pre, stage_cb_ud);
++        }
++    }
++
++    // llama_sampler_apply(chain, &cur_p), one sampler at a time when observed
++    void apply_chain() {
++        if (!stage_cb || params.backend_sampling) {
++            llama_sampler_apply(chain, &cur_p);
++            return;
++        }
++        const int32_t n = llama_sampler_chain_n(chain);
++        for (int32_t i = 0; i < n; ++i) {
++            llama_sampler * s = llama_sampler_chain_get(chain, i);
++            if (s->iface->apply == nullptr) {
++                continue;
++            }
++            const char * name = llama_sampler_name(s);
++            stage(name, true, s);
++            llama_sampler_apply(s, &cur_p);
++            stage(name, false, s);
++        }
++    }
++
+     void reset() {
+         prev.clear();
+ 
+@@ -595,6 +624,13 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
+     }
+ }
+ 
++void common_sampler_set_stage_cb(struct common_sampler * gsmpl, common_sampler_stage_cb cb, void * user_data) {
++    if (gsmpl) {
++        gsmpl->stage_cb    = cb;
++        gsmpl->stage_cb_ud = user_data;
++    }
++}
++
+ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
+     if (!gsmpl) {
+         return nullptr;
+@@ -640,14 +676,20 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+         }
+     }
+ 
++    gsmpl->stage("raw"); // [visualizer-trace]
++
+     // apply reasoning budget first
+     llama_sampler_apply(rbudget, &cur_p);
++    if (rbudget) {
++        gsmpl->stage("reasoning_budget");
++    }
+ 
+     if (grammar_first && grammar_should_apply(gsmpl)) {
+         llama_sampler_apply(grmr, &cur_p);
++        gsmpl->stage("grammar");
+     }
+ 
+-    llama_sampler_apply(chain, &cur_p);
++    gsmpl->apply_chain();
+ 
+     id = cur_p.data[cur_p.selected].id;
+ 
+@@ -672,13 +714,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
+     gsmpl->set_logits(ctx, idx);
+ 
++    gsmpl->stage("raw"); // [visualizer-trace] a second "raw" restarts the stage list
++
+     llama_sampler_apply(rbudget,  &cur_p);
++    if (rbudget) {
++        gsmpl->stage("reasoning_budget");
++    }
+ 
+     if (grammar_should_apply(gsmpl)) {
+         llama_sampler_apply(grmr,  &cur_p);
++        gsmpl->stage("grammar");
+     }
+ 
+-    llama_sampler_apply(chain, &cur_p);
++    gsmpl->apply_chain();
+ 
+     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+ 
+diff --git a/common/sampling.h b/common/sampling.h
+index f19bd27c4..ee9314d62 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -55,6 +55,18 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
+ // get the underlying llama_sampler_chain
+ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+ 
++// [visualizer-trace] optional per-stage observer for common_sampler_sample()
++//
++// When set, common_sampler_sample() applies the chain one sampler at a time and calls the observer
++// with pre == true right before and pre == false right after each sampler, plus once with
++// smpl == nullptr for the "raw" logits and for the "reasoning_budget" / "grammar" stages.
++// stage is the llama.cpp sampler name (llama_sampler_name()). The observer must not modify cur_p.
++// Has no effect with backend sampling. Pass cb == nullptr to remove.
++typedef void (*common_sampler_stage_cb)(
++        struct llama_sampler * smpl, const char * stage, const llama_token_data_array * cur_p, bool pre, void * user_data);
++
++void common_sampler_set_stage_cb(struct common_sampler * gsmpl, common_sampler_stage_cb cb, void * user_data);
++
+ // extended sampling implementation:
+ //
+ // - set logits
+-- 
+2.47.1.windows.2
+

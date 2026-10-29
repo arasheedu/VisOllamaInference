@@ -1,0 +1,31 @@
+From 844194d6c347706f3375c35959696a75dd7a390a Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 15:47:53 -0700
+Subject: [PATCH 5/6] server: capture sampler stages in sample step mode at any
+ detail
+
+[visualizer-trace] step: "sample" pauses between decode.sample.stage
+events, so it needs them even with detail: "layers".
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ tools/server/server-trace.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-trace.cpp b/tools/server/server-trace.cpp
+index 15a6f6500..fb94476de 100644
+--- a/tools/server/server-trace.cpp
++++ b/tools/server/server-trace.cpp
+@@ -849,7 +849,8 @@ void server_trace::attn_emit(int il, const std::vector<float> & w_avg, const std
+ void server_trace::sample_begin(common_sampler * smpl, int32_t step) {
+     sample_step = step;
+     draw = -1.0;
+-    if (p.detail == SERVER_TRACE_FULL) {
++    // stages are a full-detail event; sample step mode needs them at any detail
++    if (p.detail == SERVER_TRACE_FULL || p.step == SERVER_TRACE_STEP_SAMPLE) {
+         common_sampler_set_stage_cb(smpl, stage_cb, this);
+     }
+ }
+-- 
+2.47.1.windows.2
+
