@@ -185,6 +185,41 @@ describe('engine: buffer', () => {
     expect(p.dropped).toBeGreaterThan(0);
   });
 
+  it('compacts a buffer of 200k+ events without losing tokens (deep-tier scale)', () => {
+    const p = new Player('r', { detail: 'deep' });
+    let seq = 0;
+    const base = { v: 1 as const, req: 'r' };
+    // 300 steps × (1 token + 700 droppable deep nodes) ≈ 210k events
+    for (let step = 0; step < 300; step++) {
+      for (let i = 0; i < 700; i++)
+        p.push(
+          {
+            ...base,
+            seq: seq++,
+            t_ns: seq,
+            type: 'decode.node',
+            step,
+            layer: i % 28,
+            i: i % 25,
+            name: 'n',
+            op: 'ADD',
+            shape: [1],
+            ms: 0,
+          },
+          0,
+        );
+      p.push(
+        { ...base, seq: seq++, t_ns: seq, type: 'decode.token', step, text: 'x', is_eos: false },
+        0,
+      );
+    }
+    expect(p.dropped).toBeGreaterThan(0);
+    expect(p.events.filter((e) => e.type === 'decode.token').length).toBe(300);
+    expect(p.events.length).toBeLessThanOrEqual(200_000);
+    for (let i = 1; i < p.events.length; i++)
+      expect(p.events[i].seq).toBeGreaterThan(p.events[i - 1].seq);
+  });
+
   it('sorts out-of-order arrivals by seq', () => {
     const tr = generateTrace({ detail: 'basic', layers: 4, responseTokens: 10, seed: 1 });
     const ev = tr.events.slice();

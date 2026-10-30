@@ -105,19 +105,21 @@ export class Player implements ClockSource {
     const target = Math.floor(this.capacity * 0.9);
     let excess = this.events.length - target;
     let removedBeforeCursor = 0;
-    const kept: TraceEvent[] = [];
-    for (let i = 0; i < this.events.length; i++) {
-      const e = this.events[i];
+    // compact in place: spreading ~180k events into push() overflows the
+    // argument limit and threw after the buffer had been cleared
+    const ev = this.events;
+    let w = 0;
+    for (let i = 0; i < ev.length; i++) {
+      const e = ev[i];
       if (excess > 0 && PRIORITY[e.type] === 'droppable') {
         excess--;
         this.dropped++;
         if (i < this.cursor) removedBeforeCursor++;
         continue;
       }
-      kept.push(e);
+      ev[w++] = e;
     }
-    this.events.length = 0;
-    this.events.push(...kept);
+    ev.length = w;
     this.cursor -= removedBeforeCursor;
   }
 
