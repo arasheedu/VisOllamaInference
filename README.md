@@ -124,3 +124,7 @@ Every run is saved as `.ndjson` plus a `.response.txt` under the app's `userData
 | "Trace tokens differ from /api/chat response" | Output parsers in Ollama (thinking or tool parsing) changed the visible text compared with the raw tokens. |
 | Merge animation skipped | The model's tokenizer isn't byte-level BPE (e.g. SentencePiece), or the JS tokenizer disagrees with the runner's ids. |
 | Port 4711 in use | Change it in ⚙ (the hub restarts), and use the same port in `OLLAMA_TRACE_URL`. |
+
+## License
+
+MIT, see [LICENSE](LICENSE). The patches in `ollama-patch/` modify Ollama and llama.cpp, which are also MIT-licensed; their original copyright notices apply to the code they contain.
