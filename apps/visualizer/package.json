@@ -13,7 +13,8 @@
     "e2e": "electron-vite build && playwright test",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "package": "electron-vite build && electron-builder --config electron-builder.yml",
-    "package:dir": "electron-vite build && electron-builder --config electron-builder.yml --dir"
+    "package:dir": "electron-vite build && electron-builder --config electron-builder.yml --dir",
+    "record": "tsx e2e/record-modes.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.1",

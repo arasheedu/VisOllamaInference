@@ -9,3 +9,4 @@ playwright-report/
 ollama/
 /llama.cpp/
 /build-*/
+/recordings/
