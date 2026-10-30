@@ -178,6 +178,8 @@ export interface ViewModel {
   /** recent per-step details for the inspector (bounded) */
   steps: Record<number, StepDetail>;
   streamChunks: StreamChunkState[];
+  /** steps that have deep-tier data (logit lens) in the buffer, ascending */
+  deepSteps: number[];
   lastEvent: TraceEvent | null;
   recent: TraceEvent[];
   eventsApplied: number;

@@ -541,6 +541,47 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
 
 // ---- logit lens ---------------------------------------------------------------
 
+/** A word without deep data: say why, and offer the nearest words that have it. */
+function NoDeepData({ step }: { step: number }) {
+  const deep = useUi((s) => s.vm.deepSteps);
+  const tokens = useUi((s) => s.vm.responseTokens);
+  const word = (st: number) => showToken(tokens.find((t) => t.step === st)?.text ?? `#${st}`);
+  let prev: number | undefined;
+  let next: number | undefined;
+  for (const s of deep) {
+    if (s < step) prev = s;
+    else if (s > step && next === undefined) next = s;
+  }
+  const go = (s: number) => setUi({ inspector: { kind: 'token', step: s } });
+  return (
+    <div className="deep-empty" data-testid="no-deep-data">
+      No layer data for “{word(step)}”. While a Deep run plays live, Ollama traces the first few
+      words and then every 4th word, to keep generation fast; words generated with Step on are
+      always traced. Words that have layer data are underlined in blue in the Response panel.
+      {(prev !== undefined || next !== undefined) && (
+        <div className="deep-nearest">
+          Nearest traced:{' '}
+          {prev !== undefined && (
+            <button onClick={() => go(prev)}>
+              ← “{word(prev)}” (step {prev})
+            </button>
+          )}
+          {next !== undefined && (
+            <button onClick={() => go(next)}>
+              “{word(next)}” (step {next}) →
+            </button>
+          )}
+        </div>
+      )}
+      {deep.length === 0 && (
+        <div className="deep-nearest">
+          This run has no layer data in memory (very long runs drop the oldest).
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LogitLens({
   sd,
   focus,
@@ -561,12 +602,18 @@ function LogitLens({
     return m;
   }, [sd]);
   const rows = Math.max(n, byLayer.size);
+  const noData = !!sd && sd.lens.length === 0;
   return (
     <div className="deep-lens" data-testid="logit-lens">
       <div className="deep-sub">
         Logit lens <span className="muted">· layer’s best guess</span>
       </div>
-      <div className="deep-lens-rows">
+      {noData && (
+        <div className="deep-lens-none" data-testid="lens-none">
+          No lens for this word (step {sd.step}).
+        </div>
+      )}
+      <div className="deep-lens-rows" style={noData ? { opacity: 0.35 } : undefined}>
         {Array.from({ length: rows }, (_, layer) => {
           const l = byLayer.get(layer);
           const top = l?.top[0];
@@ -777,11 +824,8 @@ export function DeepView() {
             <button onClick={() => setUi({ inspector: null })}>back to live</button>
           </div>
         )}
-        {empty ? (
-          <div className="deep-empty">
-            No deep data for this token. Outside step mode the runner traces every 4th token in
-            Deep; tokens generated in step mode are always traced.
-          </div>
+        {empty && sd ? (
+          <NoDeepData step={sd.step} />
         ) : sd ? (
           <>
             <BlockDiagram sd={sd} layer={focus} />

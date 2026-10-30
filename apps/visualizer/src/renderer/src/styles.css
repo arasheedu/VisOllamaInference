@@ -1061,3 +1061,23 @@ textarea:focus {
 .badges .badge.step-wait {
   pointer-events: auto;
 }
+/* response words that have deep-tier data (logit lens, layer graph) */
+.tok.has-deep {
+  box-shadow: inset 0 -2px 0 #7c9cffaa;
+}
+.deep-lens-none {
+  font-size: 11px;
+  color: #fbbf24;
+  padding: 2px 4px 6px;
+}
+.deep-nearest {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.deep-nearest button {
+  font-size: 12px;
+  padding: 2px 10px;
+}

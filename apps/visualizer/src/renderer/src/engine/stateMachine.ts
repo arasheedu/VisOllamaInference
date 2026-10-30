@@ -58,6 +58,7 @@ export function emptyViewModel(): ViewModel {
     stepDetail: null,
     steps: {},
     streamChunks: [],
+    deepSteps: [],
     lastEvent: null,
     recent: [],
     eventsApplied: 0,
@@ -355,6 +356,8 @@ export class InferenceStateMachine {
         break;
       }
       case 'decode.lens':
+        if (!vm.deepSteps.includes(e.step))
+          vm.deepSteps = [...vm.deepSteps, e.step].sort((a, b) => a - b);
         this.updateStep(e.step, (sd) => ({
           ...sd,
           lens: [...sd.lens, { layer: e.layer, top: e.top, entropy: e.entropy, wall }],
@@ -412,6 +415,15 @@ export class InferenceStateMachine {
       d.totalMs = (t - this.t0) / 1e6;
     }
     vm.derived = d;
+  }
+
+  /** Forget deep steps whose events were dropped from the buffer. */
+  pruneDeepSteps(keep: Set<number>) {
+    const next = this.vm.deepSteps.filter((s) => keep.has(s));
+    if (next.length !== this.vm.deepSteps.length) {
+      this.vm.deepSteps = next;
+      this.dirty = true;
+    }
   }
 
   /** Immutable snapshot; returns the same object if nothing changed. */

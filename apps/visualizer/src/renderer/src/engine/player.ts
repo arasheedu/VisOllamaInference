@@ -121,6 +121,9 @@ export class Player implements ClockSource {
     }
     ev.length = w;
     this.cursor -= removedBeforeCursor;
+    const lens = new Set<number>();
+    for (const e of ev) if (e.type === 'decode.lens') lens.add(e.step);
+    this.machine.pruneDeepSteps(lens);
   }
 
   // ---- ClockSource ----

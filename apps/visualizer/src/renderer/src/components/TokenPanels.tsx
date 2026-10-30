@@ -1,5 +1,5 @@
 import { atLeast } from 'trace-schema';
-import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { ResponseToken } from '../engine/types';
 import { session } from '../session';
 import { setUi, useUi } from '../store';
@@ -120,10 +120,13 @@ export function PromptTokens() {
 
 const TokenSpan = memo(function TokenSpan({
   t,
+  deep,
   onHover,
   onLeave,
 }: {
   t: ResponseToken;
+  /** has deep-tier data (logit lens, layer graph) */
+  deep?: boolean;
   onHover: (e: React.MouseEvent, t: ResponseToken) => void;
   onLeave: () => void;
 }) {
@@ -131,7 +134,7 @@ const TokenSpan = memo(function TokenSpan({
   const low = t.entropy !== undefined && t.entropy > 1.4;
   return (
     <span
-      className={`tok fresh ${low ? 'lowconf' : ''}`}
+      className={`tok fresh ${low ? 'lowconf' : ''} ${deep ? 'has-deep' : ''}`}
       style={low ? { textDecoration: 'underline dotted #f59e0b' } : undefined}
       onMouseMove={(e) => onHover(e, t)}
       onMouseLeave={onLeave}
@@ -147,6 +150,8 @@ const TokenSpan = memo(function TokenSpan({
 
 export function ResponseStream() {
   const tokens = useUi((s) => s.vm.responseTokens);
+  const deepList = useUi((s) => s.vm.deepSteps);
+  const deepSteps = useMemo(() => new Set(deepList), [deepList]);
   const phase = useUi((s) => s.vm.phase);
   const detail = useUi((s) => s.settings.detail);
   const uninstrumented = useUi((s) => s.uninstrumented);
@@ -212,7 +217,13 @@ export function ResponseStream() {
           style={{ flex: 1 }}
         >
           {tokens.map((t, i) => (
-            <TokenSpan key={i} t={t} onHover={onHover} onLeave={() => setTip(null)} />
+            <TokenSpan
+              key={i}
+              t={t}
+              deep={detail === 'deep' && deepSteps.has(t.step)}
+              onHover={onHover}
+              onLeave={() => setTip(null)}
+            />
           ))}
           {phase === 'decoding' && <span className="caret" />}
         </div>
