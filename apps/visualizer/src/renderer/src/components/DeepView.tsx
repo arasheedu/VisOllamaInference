@@ -1,22 +1,73 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { session } from '../session';
 import { setUi, useUi } from '../store';
 import { OP_COLOR, showToken } from '../theme';
 import type { NodeState, StepDetail, ViewModel } from '../engine/types';
 
 // ---- data helpers -----------------------------------------------------------
 
-/** The step to show: the current one if it has deep data, else the latest that does. */
+const hasDeep = (d: StepDetail | null | undefined) =>
+  !!d && (d.nodes.length > 0 || d.lens.length > 0 || d.heads.length > 0);
+
+/** Deep data of one step straight from the player buffer (older steps leave the view model). */
+function deepFromBuffer(step: number): StepDetail {
+  const sd: StepDetail = {
+    step,
+    ops: [],
+    residual: [],
+    attn: [],
+    kvWrites: [],
+    samplingStages: [],
+    layerMs: [],
+    moe: [],
+    nodes: [],
+    lens: [],
+    heads: [],
+  };
+  for (const e of session.active?.events ?? []) {
+    if (!('step' in e) || e.step !== step) continue;
+    if (e.type === 'decode.node') {
+      const { layer, i, name, op, shape, ms, src, stats } = e;
+      sd.nodes.push({ layer, i, name, op, shape, ms, src, stats, wall: -Infinity });
+    } else if (e.type === 'decode.lens')
+      sd.lens.push({ layer: e.layer, top: e.top, entropy: e.entropy, wall: -Infinity });
+    else if (e.type === 'decode.attn.heads')
+      sd.heads.push({
+        layer: e.layer,
+        from: e.from,
+        nKvHead: e.n_kv_head,
+        rows: e.rows,
+        wall: -Infinity,
+      });
+  }
+  return sd;
+}
+
+/** Response token picked in the response panel (via the inspector), if any. */
+const useSelectedStep = () =>
+  useUi((s) => (s.inspector?.kind === 'token' ? s.inspector.step : null));
+
+/**
+ * The step to show: a token clicked in the response panel, else the current
+ * step if it has deep data, else the latest step that does.
+ */
 function useDeepStep(): StepDetail | null {
   const sd = useUi((s) => s.vm.stepDetail);
   const steps = useUi((s) => s.vm.steps);
+  const selected = useSelectedStep();
+  const applied = useUi((s) => s.vm.eventsApplied);
   return useMemo(() => {
-    const has = (d: StepDetail | null | undefined) =>
-      !!d && (d.nodes.length > 0 || d.lens.length > 0 || d.heads.length > 0);
+    if (selected !== null) {
+      const own = steps[selected];
+      return hasDeep(own) ? own : deepFromBuffer(selected);
+    }
+    const has = hasDeep;
     if (has(sd)) return sd;
     let best: StepDetail | null = null;
     for (const d of Object.values(steps)) if (has(d) && (!best || d.step > best.step)) best = d;
     return best;
-  }, [sd, steps]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sd, steps, selected, selected !== null ? applied : 0]);
 }
 
 /** Text of the token at KV position `pos` (prompt first, then the response). */
@@ -375,7 +426,7 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
             const n = ran.get(b.n.i);
             const g = groupOf(b.n.name, b.n.op);
             const c = GROUP_COLOR[g];
-            const latest = !!n && n.wall === lastWall;
+            const latest = !!n && n.wall === lastWall && lastWall > -Infinity;
             return (
               <g
                 key={`${b.n.i}-${n?.wall ?? 'pending'}`}
@@ -668,12 +719,29 @@ export function DeepView() {
     return Math.max(0, best);
   }, [sd]);
   const focus = pinned ?? following;
+  const selected = useSelectedStep();
+  const selText = useUi((s) => {
+    const t = selected === null ? null : s.vm.responseTokens.find((x) => x.step === selected);
+    return t ? showToken(t.text) : null;
+  });
+  const empty = !!sd && !hasDeep(sd);
 
   return (
     <div className="deep" data-testid="deep-view">
       <LogitLens sd={sd} focus={focus} pinned={pinned !== null} />
       <div className="deep-right">
-        {sd ? (
+        {selected !== null && (
+          <div className="deep-selected mono" data-testid="deep-selected">
+            showing “{selText ?? '…'}” (step {selected})
+            <button onClick={() => setUi({ inspector: null })}>back to live</button>
+          </div>
+        )}
+        {empty ? (
+          <div className="deep-empty">
+            No deep data for this token. Outside step mode the runner traces every 4th token in
+            Deep; tokens generated in step mode are always traced.
+          </div>
+        ) : sd ? (
           <>
             <BlockDiagram sd={sd} layer={focus} />
             <HeadsHeatmap sd={sd} layer={focus} />

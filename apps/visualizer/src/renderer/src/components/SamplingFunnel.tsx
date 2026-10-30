@@ -64,7 +64,31 @@ function useTextFor() {
 function useStageSource(): StepDetail | null {
   const sd = useUi((s) => s.vm.stepDetail);
   const steps = useUi((s) => s.vm.steps);
+  // a token clicked in the response panel (inspector) takes precedence
+  const selected = useUi((s) => (s.inspector?.kind === 'token' ? s.inspector.step : null));
   return useMemo(() => {
+    if (selected !== null) {
+      const own = steps[selected];
+      if (own?.samplingStages.length) return own;
+      const stages: StepDetail['samplingStages'] = [];
+      for (const e of session.active?.events ?? [])
+        if (e.type === 'decode.sample.stage' && e.step === selected)
+          stages.push({ ...e, wall: -Infinity });
+      if (stages.length)
+        return {
+          step: selected,
+          ops: [],
+          residual: [],
+          attn: [],
+          kvWrites: [],
+          samplingStages: stages,
+          layerMs: [],
+          moe: [],
+          nodes: [],
+          lens: [],
+          heads: [],
+        };
+    }
     if (sd && sd.samplingStages.length) return sd;
     let best: StepDetail | null = null;
     for (const k of Object.keys(steps)) {
@@ -72,7 +96,7 @@ function useStageSource(): StepDetail | null {
       if (d.samplingStages.length && (!best || d.step > best.step)) best = d;
     }
     return best ?? sd;
-  }, [sd, steps]);
+  }, [sd, steps, selected]);
 }
 
 /** Empty state: sampling runs only after the last layer of the first token. */

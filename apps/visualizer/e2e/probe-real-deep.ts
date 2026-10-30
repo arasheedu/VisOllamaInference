@@ -96,6 +96,17 @@ const HTTP = 11438;
       await page.screenshot({ path: `${out}/real-deep-inspector-${k}.png` });
     }
     console.log('LENS ROWS', await page.locator('.inspector-lens-row').count());
+    for (const k of [1, 3, 8]) {
+      await page.locator('[data-testid=response] .tok').nth(k).click();
+      await page.waitForTimeout(500);
+      const sel = await page.locator('[data-testid=deep-selected]').textContent();
+      const rows = await page.locator('.deep-lens-row .deep-lens-tok').allTextContents();
+      const empty = await page.locator('.deep-right .deep-empty').count();
+      console.log('SELECT', k, sel, 'lens:', rows.slice(14).join('|'), 'empty:', empty);
+      await page.screenshot({ path: `${out}/real-deep-select-${k}.png` });
+    }
+    await page.getByRole('button', { name: 'back to live' }).click();
+    console.log('after back', await page.locator('[data-testid=deep-selected]').count());
     console.log('errors', errors);
   } finally {
     await app.close();

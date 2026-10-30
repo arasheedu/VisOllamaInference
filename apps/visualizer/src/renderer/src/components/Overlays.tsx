@@ -121,13 +121,19 @@ function TokenLens({
   chosen: number | undefined;
   all: TraceEvent[];
 }) {
+  const detail = useUi((s) => s.settings.detail);
   const lens = all
     .filter(
       (e): e is Extract<TraceEvent, { type: 'decode.lens' }> =>
         e.type === 'decode.lens' && e.step === step,
     )
     .sort((a, b) => a.layer - b.layer);
-  if (!lens.length) return null;
+  if (!lens.length)
+    return detail === 'deep' ? (
+      <div style={{ color: 'var(--muted)', marginBottom: 10 }}>
+        No logit lens for this token: outside step mode the runner traces every 4th token in Deep.
+      </div>
+    ) : null;
   const label = (c: { id: number; text?: string }) => showToken(c.text ?? `#${c.id}`);
   // first layer from which the chosen token stays the top guess
   let settle: number | null = null;

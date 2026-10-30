@@ -1020,3 +1020,17 @@ textarea:focus {
   white-space: pre;
   overflow: hidden;
 }
+.deep-right:has(.deep-selected) {
+  grid-template-rows: auto minmax(0, 1.7fr) minmax(0, 1fr) auto;
+}
+.deep-selected {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  color: #fbbf24;
+}
+.deep-selected button {
+  font-size: 11px;
+  padding: 1px 8px;
+}
