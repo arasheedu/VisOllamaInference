@@ -983,3 +983,40 @@ textarea:focus {
   position: absolute;
   inset: 0;
 }
+.inspector-lens {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.inspector-lens-row {
+  display: grid;
+  grid-template-columns: 30px 1fr 74px;
+  gap: 6px;
+  align-items: center;
+  font-size: 11px;
+}
+.inspector-lens-row .muted {
+  color: var(--muted);
+}
+.inspector-lens-bar {
+  position: relative;
+  height: 14px;
+  background: #1a1f2c;
+  border-radius: 3px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+}
+.inspector-lens-bar > span:first-child {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  opacity: 0.55;
+}
+.inspector-lens-bar > span:last-child {
+  position: relative;
+  padding-left: 4px;
+  white-space: pre;
+  overflow: hidden;
+}

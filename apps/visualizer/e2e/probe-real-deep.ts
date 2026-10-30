@@ -90,6 +90,12 @@ const HTTP = 11438;
     await page.waitForTimeout(800);
     await page.screenshot({ path: `${out}/real-deep-done.png` });
     console.log('DONE', JSON.stringify(await state()));
+    for (const k of [1, 2]) {
+      await page.locator('[data-testid=response] .tok').nth(k).click();
+      await page.waitForTimeout(600);
+      await page.screenshot({ path: `${out}/real-deep-inspector-${k}.png` });
+    }
+    console.log('LENS ROWS', await page.locator('.inspector-lens-row').count());
     console.log('errors', errors);
   } finally {
     await app.close();

@@ -236,7 +236,9 @@ function summary(ev: SampleStageEvent, T: number, P: number): string {
     case 'softmax':
       return `${ev.candidates.length} candidates`;
     case 'draw':
-      return `u = ${ev.draw?.toFixed(3) ?? '?'}`;
+      if (ev.draw !== undefined) return `u = ${ev.draw.toFixed(3)}`;
+      // no random number: one candidate left (certain) or a greedy pick
+      return ev.candidates.length <= 1 ? 'certain · no draw' : 'greedy · no draw';
     default:
       return `${ev.candidates.length} candidates`;
   }
@@ -491,7 +493,7 @@ function DrawBody(p: BodyProps & { H: number }) {
     x += w;
     return s;
   });
-  const u = ev.draw ?? 0;
+  const u = ev.draw;
   return (
     <div>
       <svg viewBox={`0 0 ${W} ${H}`} height={H} preserveAspectRatio="none">
@@ -507,14 +509,16 @@ function DrawBody(p: BodyProps & { H: number }) {
             <title>{`${showToken(p.textFor(s.c.id))}  p=${s.c.v.toFixed(4)}`}</title>
           </rect>
         ))}
-        <motion.g
-          initial={{ x: 0, opacity: 0 }}
-          animate={{ x: (u / total) * W, opacity: 1 }}
-          transition={trans}
-        >
-          <polygon points="-5,0 5,0 0,7" fill="#fff" />
-          <line x1={0} x2={0} y1={6} y2={H - 4} stroke="#fff" strokeWidth={1.5} />
-        </motion.g>
+        {u !== undefined && (
+          <motion.g
+            initial={{ x: 0, opacity: 0 }}
+            animate={{ x: (u / total) * W, opacity: 1 }}
+            transition={trans}
+          >
+            <polygon points="-5,0 5,0 0,7" fill="#fff" />
+            <line x1={0} x2={0} y1={6} y2={H - 4} stroke="#fff" strokeWidth={1.5} />
+          </motion.g>
+        )}
       </svg>
       {expanded && chosen && (
         <div
@@ -525,8 +529,15 @@ function DrawBody(p: BodyProps & { H: number }) {
             color: 'var(--muted)',
           }}
         >
-          u = {u.toFixed(4)} → <b style={{ color: '#34d399' }}>{showToken(p.textFor(chosen.id))}</b>{' '}
-          (p = {(chosen.v * 100).toFixed(1)}%, rank {chosenIdx + 1})
+          {u !== undefined ? (
+            <>u = {u.toFixed(4)} → </>
+          ) : cands.length <= 1 ? (
+            <>only one candidate left, no random draw needed → </>
+          ) : (
+            <>highest-probability pick (greedy), no random draw → </>
+          )}
+          <b style={{ color: '#34d399' }}>{showToken(p.textFor(chosen.id))}</b> (p ={' '}
+          {(chosen.v * 100).toFixed(1)}%, rank {chosenIdx + 1})
         </div>
       )}
     </div>

@@ -88,7 +88,11 @@ function eventsFor(t: InspectorTarget): TraceEvent[] {
           e.type !== 'decode.layer' &&
           e.type !== 'decode.residual' &&
           e.type !== 'decode.attn' &&
-          e.type !== 'decode.kv.write',
+          e.type !== 'decode.kv.write' &&
+          // deep tier: shown as the logit lens table, too bulky for the raw dump
+          e.type !== 'decode.node' &&
+          e.type !== 'decode.lens' &&
+          e.type !== 'decode.attn.heads',
       );
     case 'prompt-token':
       return ev.filter((e) => e.type === 'tokenize.done');
@@ -105,6 +109,75 @@ function eventsFor(t: InspectorTarget): TraceEvent[] {
         (e) => e.type === 'decode.sample.stage' && e.step === t.step && e.stage === t.stage,
       );
   }
+}
+
+/** Deep tier: each layer's best guess for this token (logit lens). */
+function TokenLens({
+  step,
+  chosen,
+  all,
+}: {
+  step: number;
+  chosen: number | undefined;
+  all: TraceEvent[];
+}) {
+  const lens = all
+    .filter(
+      (e): e is Extract<TraceEvent, { type: 'decode.lens' }> =>
+        e.type === 'decode.lens' && e.step === step,
+    )
+    .sort((a, b) => a.layer - b.layer);
+  if (!lens.length) return null;
+  const label = (c: { id: number; text?: string }) => showToken(c.text ?? `#${c.id}`);
+  // first layer from which the chosen token stays the top guess
+  let settle: number | null = null;
+  for (let i = lens.length - 1; i >= 0 && lens[i].top[0]?.id === chosen; i--)
+    settle = lens[i].layer;
+  const firstSeen = lens.find((l) => l.top.some((c) => c.id === chosen))?.layer;
+  return (
+    <div data-testid="inspector-lens" style={{ marginBottom: 10 }}>
+      <div style={{ color: 'var(--muted)', marginBottom: 4 }}>
+        How the choice formed: each layer's best guess (logit lens)
+      </div>
+      <div className="kv" style={{ marginBottom: 4 }}>
+        <span>first in top-{lens[0].top.length}</span>
+        <span>{firstSeen !== undefined ? `layer ${firstSeen}` : 'never'}</span>
+        <span>top guess from</span>
+        <span>{settle !== null ? `layer ${settle} on` : 'not the final top guess'}</span>
+      </div>
+      <div className="inspector-lens">
+        {lens.map((l) => {
+          const top = l.top[0];
+          const hit = top?.id === chosen;
+          const pc = l.top.find((c) => c.id === chosen);
+          return (
+            <div
+              key={l.layer}
+              className="inspector-lens-row"
+              title={l.top.map((c) => `${label(c)}  ${(c.p * 100).toFixed(1)}%`).join('\n')}
+            >
+              <span className="mono muted">L{l.layer}</span>
+              <span className="inspector-lens-bar">
+                <span
+                  style={{
+                    width: `${Math.max(2, (top?.p ?? 0) * 100)}%`,
+                    background: hit ? '#34d399' : '#3b4a7a',
+                  }}
+                />
+                <span className="mono" style={{ color: hit ? '#34d399' : undefined }}>
+                  {top ? label(top).slice(0, 16) : '–'}
+                </span>
+              </span>
+              <span className="mono muted">
+                {top ? `${(top.p * 100).toFixed(0)}%` : ''}
+                {!hit && pc ? ` · ✓${(pc.p * 100).toFixed(0)}%` : ''}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function Derived({ t, events }: { t: InspectorTarget; events: TraceEvent[] }) {
@@ -138,6 +211,7 @@ function Derived({ t, events }: { t: InspectorTarget; events: TraceEvent[] }) {
             </>
           )}
         </div>
+        <TokenLens step={t.step} chosen={chosen} all={all} />
         {stages.length > 0 && (
           <>
             <div style={{ color: 'var(--muted)', marginBottom: 4 }}>
