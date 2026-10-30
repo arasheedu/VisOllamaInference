@@ -18,6 +18,7 @@ Press **Run**. Pick a detail level:
 - **Basic**: phase pipeline, token chips, top-k sampling bars, response stream, timeline.
 - **Layers**: adds the per-layer stack (timing / norm) and KV cache bar.
 - **Full**: forward-pass sub-blocks, attention arcs, residual stream, KV slot grid, the full sampler funnel (raw → rep-penalty → temperature → top-k → top-p → min-p → softmax → draw), tokenizer merge animation and byte-level streaming. Full detail is a slow-motion mode. Tick **Step** and use *Step token / Step layer / Step sampling stage / Continue*.
+- **Deep**: everything in Full plus a **Layer zoom** view: the layer's real operation graph (every ggml node with its shape, time and value stats; *Step op* walks it one node at a time), a **logit lens** column (what each layer would predict if decoding stopped there; click a row to pin that layer) and a **per-head attention** heatmap. Deep is meant for step mode and turns it on. It needs the deep-tier runner build; see [docs/deep-tier.md](docs/deep-tier.md).
 
 Click any token, layer, op or sampling stage to open the **Inspector** with the raw events and derived numbers. Press `Ctrl+Shift+D` to toggle the engine debug panel. **Tour** runs a guided walkthrough.
 
@@ -65,7 +66,7 @@ This Ollama version runs every GGUF model inside llama.cpp's `llama-server` subp
 | Token data | The app streams the public `/api/chat`. The trace socket only adds what the API can't see. |
 | Correlation | The app generates a UUID per run and sends it as `X-Trace-Request-Id`. Producers echo it in every event. |
 | Animation | A playback clock with per-stage minimum on-screen durations. It speeds up smoothly (up to 8×) when the display lags real time by more than 2 s, and returns to 1× below 250 ms. The current dilation factor is always shown. |
-| Detail | `X-Trace-Detail: basic\|layers\|full`. Events above the selected level are filtered at ingestion. In Full detail, a backlog over 4 s drops to Layers and shows a "fast-forwarding" badge. |
+| Detail | `X-Trace-Detail: basic\|layers\|full\|deep`. Events above the selected level are filtered at ingestion. In Full detail, a backlog over 4 s drops to Layers and shows a "fast-forwarding" badge. |
 | Step mode | `X-Trace-Step: token`. The runner blocks per step until it gets an `ack` on the socket. The app sends acks only when its buffer runs dry. |
 
 ## Repository layout

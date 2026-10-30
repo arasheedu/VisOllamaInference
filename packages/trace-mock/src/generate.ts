@@ -1,4 +1,5 @@
 import {
+  atLeast,
   includedAtDetail,
   type DetailLevel,
   type EventType,
@@ -15,6 +16,7 @@ import {
   rng,
   SPECIALS,
 } from './model';
+import { headRows, layerNodes, lensTop, modelDims, nodeStats } from './deep';
 
 export type Granularity = 'token' | 'layer' | 'sample';
 export type TraceItem =
@@ -47,6 +49,10 @@ export interface GenerateOptions {
   gpuLayers?: number;
   /** mixture-of-experts: n experts, k routed per token */
   experts?: { n: number; k: number };
+  /** deep tier: emit deep events on steps < 3 and every deepStride-th step */
+  deepStride?: number;
+  /** deep tier: attention window (positions per head row) */
+  attnWindow?: number;
   /** start of the trace on the emitter's monotonic clock */
   t0Ns?: number;
 }
@@ -94,6 +100,8 @@ export function generateTrace(o: GenerateOptions = {}): GeneratedTrace {
     minP: 0,
     repeatPenalty: 1.1,
     heads: 0,
+    deepStride: 12,
+    attnWindow: 256,
     t0Ns: 1_000_000_000,
     ...o,
   };
@@ -197,8 +205,17 @@ export function generateTrace(o: GenerateOptions = {}): GeneratedTrace {
     (i) => !tok.isSpecial(i),
   );
 
+  // deep tier uses its own RNG so lower tiers stay identical for a given seed
+  const rd = rng(opt.seed ^ 0x5eed);
+  const dims = modelDims(opt.layers);
+  const piece = (id: number) => tok.piece(id);
+
   for (let step = 0; step < respIds.length; step++) {
     const target = respIds[step];
+    const deep =
+      atLeast(opt.detail, 'deep') && (step < 3 || step % Math.max(1, opt.deepStride) === 0);
+    const nodes = deep ? layerNodes(dims, pos0(nPrompt, step) + 1) : [];
+    const finalP = 0.55 + 0.4 * rd();
     const pos = nPrompt + step;
     const thisStepMs = jitter(stepMs, 0.1);
     const layerMs = (thisStepMs * 0.85) / opt.layers;
@@ -212,10 +229,31 @@ export function generateTrace(o: GenerateOptions = {}): GeneratedTrace {
       const cpuLayer = o.gpuLayers !== undefined && l >= o.gpuLayers;
       const thisLayerMs =
         jitter(layerMs, 0.2) * (l === 0 || l === opt.layers - 1 ? 1.3 : 1) * (cpuLayer ? 4 : 1);
-      if (opt.detail === 'full') {
-        for (const { op, w } of OP_SEQUENCE) {
+      const residRms = ((norm + 1) / Math.sqrt(dims.embd)) * 3;
+      let topAttn = 0.5;
+      if (atLeast(opt.detail, 'full')) {
+        for (let g = 0; g < OP_SEQUENCE.length; g++) {
+          const { op, w } = OP_SEQUENCE[g];
           const opMs = thisLayerMs * w;
-          t += ms(opMs);
+          const inGroup = nodes.map((n, i) => ({ n, i })).filter((x) => x.n.group === g);
+          if (inGroup.length) {
+            const wTot = inGroup.reduce((a, x) => a + x.n.w, 0);
+            for (const { n, i } of inGroup) {
+              const nodeMs = (opMs * n.w) / wTot;
+              t += ms(nodeMs);
+              emit('decode.node', {
+                step,
+                layer: l,
+                i,
+                name: n.name,
+                op: n.op,
+                shape: n.shape,
+                ms: round4(nodeMs),
+                ...(n.src.length ? { src: n.src } : {}),
+                stats: nodeStats(n, residRms, topAttn, pos + 1, rd),
+              });
+            }
+          } else t += ms(opMs);
           emit('decode.op', { step, layer: l, op, ms: round3(opMs) });
           if (op === 'attn_qkv') emit('decode.kv.write', { step, layer: l, pos });
           if (op === 'attn_scores') {
@@ -228,7 +266,19 @@ export function generateTrace(o: GenerateOptions = {}): GeneratedTrace {
                   top: attention(pos, l, anchors, r),
                 });
             } else {
-              emit('decode.attn', { step, layer: l, top: attention(pos, l, anchors, r) });
+              const top = attention(pos, l, anchors, r);
+              topAttn = top[0]?.w ?? topAttn;
+              emit('decode.attn', { step, layer: l, top });
+            }
+            if (deep) {
+              const hr = headRows(pos, l, opt.layers, dims.heads, anchors, opt.attnWindow, rd);
+              emit('decode.attn.heads', {
+                step,
+                layer: l,
+                from: hr.from,
+                n_kv_head: dims.kvHeads,
+                rows: hr.rows,
+              });
             }
           }
         }
@@ -238,6 +288,10 @@ export function generateTrace(o: GenerateOptions = {}): GeneratedTrace {
       const delta = Math.abs(1.1 + gaussian(r) * 0.35) * (l > opt.layers * 0.85 ? 1.8 : 1);
       norm += delta;
       emit('decode.residual', { step, layer: l, norm: round3(norm), delta_norm: round3(delta) });
+      if (deep) {
+        const lens = lensTop(l, opt.layers, target, finalP, candidatePool, piece, rd);
+        emit('decode.lens', { step, layer: l, top: lens.top, entropy: lens.entropy });
+      }
       if (o.experts) {
         const picked = new Set<number>();
         while (picked.size < o.experts.k) picked.add(Math.floor(r() * o.experts.n));
@@ -314,6 +368,8 @@ export function generateTrace(o: GenerateOptions = {}): GeneratedTrace {
 // ---- helpers --------------------------------------------------------------
 
 const round3 = (x: number) => Math.round(x * 1000) / 1000;
+const round4 = (x: number) => Math.round(x * 1e4) / 1e4;
+const pos0 = (nPrompt: number, step: number) => nPrompt + step;
 const round5 = (x: number) => Math.round(x * 1e5) / 1e5;
 
 /** Releases decoded text only once complete UTF-8 sequences are available. */

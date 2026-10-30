@@ -1,3 +1,4 @@
+import { atLeast } from 'trace-schema';
 import { useRef } from 'react';
 import { session } from '../session';
 import { useUi } from '../store';
@@ -63,7 +64,7 @@ export function Timeline() {
           </span>
         )}
         {clock.paused && <span className="badge">paused</span>}
-        {(detail === 'full' || stepMode) && <StepControls />}
+        {(atLeast(detail, 'full') || stepMode) && <StepControls />}
       </div>
       <div
         ref={ref}

@@ -8,6 +8,7 @@ import {
   type DetailLevel,
   type EventType,
   type TraceEvent,
+  atLeast,
 } from 'trace-schema';
 import { generateTrace, MOCK_MODELS, mockTokenizer, type TraceItem } from 'trace-mock/browser';
 import { Player, type StepKind } from './engine/player';
@@ -188,7 +189,19 @@ export class Session {
       this.run.eventsSinceAck++;
       if (e.type === 'request.done' || e.type === 'request.error') this.run.traceDone = true;
     }
-    if (e.type === 'request.received' && p.detail === 'full') this.loadTok(e.model);
+    if (e.type === 'request.received' && atLeast(p.detail, 'full')) this.loadTok(e.model);
+    if (e.type === 'request.received' && this.run?.req === e.req && e.detail) {
+      if (e.detail !== p.detail)
+        addWarning({
+          id: 'detail',
+          level: 'warn',
+          text:
+            p.detail === 'deep'
+              ? `This Ollama traced at "${e.detail}" detail: Deep needs the deep-tier build (ollama-trace-deep).`
+              : `This Ollama traced at "${e.detail}" detail (requested "${p.detail}").`,
+        });
+      else clearWarning('detail');
+    }
     p.push(e, now);
   }
 
@@ -223,7 +236,7 @@ export class Session {
 
   /** Full detail: hold tokenize.done long enough for the merge animation. */
   private extraHold(p: Player, e: TraceEvent): number {
-    if (e.type !== 'tokenize.done' || p.detail !== 'full' || p !== this.active) return 0;
+    if (e.type !== 'tokenize.done' || !atLeast(p.detail, 'full') || p !== this.active) return 0;
     const model = p.machine.current.model ?? '';
     const plan = planMerges(tokenizerFor(tokKey(model)), e.tokens);
     setUi({ merge: plan });
@@ -298,7 +311,7 @@ export class Session {
     setUi({ running: true, uninstrumented: false });
 
     // prefetch tokenizer for the merge animation
-    if (detail === 'full') {
+    if (atLeast(detail, 'full')) {
       this.loadTok(model);
     }
     try {
@@ -596,16 +609,23 @@ export class Session {
       });
     else clearWarning('file');
     const req = events[0].req;
+    const hasDeep = events.some((e) => !includedAtDetail(e.type, 'full'));
     const hasFull = events.some((e) => !includedAtDetail(e.type, 'layers'));
     const hasLayers = events.some((e) => !includedAtDetail(e.type, 'basic'));
-    const detail: DetailLevel = hasFull ? 'full' : hasLayers ? 'layers' : 'basic';
+    const detail: DetailLevel = hasDeep
+      ? 'deep'
+      : hasFull
+        ? 'full'
+        : hasLayers
+          ? 'layers'
+          : 'basic';
     this.run = null;
     this.players.delete(req);
     const p = this.newPlayer(req, detail, false);
     for (const e of events.filter((x) => x.req === req)) p.push(e, 0);
     void this.updateSettings({ detail });
     const model = events.find((e) => e.type === 'request.received');
-    if (detail === 'full' && model?.type === 'request.received') {
+    if (atLeast(detail, 'full') && model?.type === 'request.received') {
       this.loadTok(model.model);
     }
     this.activate(p, 'file', name);

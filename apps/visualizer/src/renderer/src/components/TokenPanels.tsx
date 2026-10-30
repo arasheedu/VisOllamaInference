@@ -1,3 +1,4 @@
+import { atLeast } from 'trace-schema';
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import type { ResponseToken } from '../engine/types';
 import { session } from '../session';
@@ -55,7 +56,7 @@ export function PromptTokens() {
   const maxChips = useUi((s) => s.settings.maxPromptChips);
   const [tip, setTip] = useState<TipState | null>(null);
   const revealed = useRevealCount(tokens.length);
-  const showMerge = detail === 'full' && phase === 'tokenizing' && merge?.ok;
+  const showMerge = atLeast(detail, 'full') && phase === 'tokenizing' && merge?.ok;
 
   const shown = Math.min(revealed, maxChips);
   const prefillLit = phase === 'prefill';
@@ -215,7 +216,7 @@ export function ResponseStream() {
           ))}
           {phase === 'decoding' && <span className="caret" />}
         </div>
-        {detail === 'full' && (
+        {atLeast(detail, 'full') && (
           <div style={{ height: 64, borderTop: '1px solid var(--line)' }}>
             <StreamBytes />
           </div>

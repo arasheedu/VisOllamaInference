@@ -287,3 +287,51 @@ describe('engine: degraded live run rebuilds final detail', () => {
     expect(last?.ops.length ?? 0).toBeGreaterThan(0);
   });
 });
+
+describe('engine: deep tier', () => {
+  const tr = generateTrace({ layers: 4, detail: 'deep', responseTokens: 4, seed: 9 });
+  const loaded = () => {
+    const p = new Player(tr.req, { detail: 'deep', live: false });
+    for (const e of tr.events) p.push(e, 0);
+    return p;
+  };
+  const runUntilPaused = (p: Player, start: number) => {
+    let now = start;
+    let vm = p.tick(now);
+    for (let k = 0; k < 10_000 && !vm.clock.paused; k++) vm = p.tick((now += FRAME));
+    return { vm, now };
+  };
+
+  it('collects nodes, logit lens and per-head attention per step', () => {
+    const p = loaded();
+    p.seek(tr.events[tr.events.length - 1].t_ns);
+    const sd = p.snapshot().steps[0];
+    expect(sd.nodes.length).toBe(4 * 22);
+    expect(sd.lens.map((l) => l.layer)).toEqual([0, 1, 2, 3]);
+    expect(sd.heads.length).toBe(4);
+    expect(sd.heads[0].rows.length).toBe(32);
+    const row = sd.heads[0].rows[0];
+    expect(row.reduce((a, b) => a + b, 0)).toBeCloseTo(1, 2);
+  });
+
+  it('full detail drops deep events at ingestion', () => {
+    const p = new Player(tr.req, { detail: 'full', live: false });
+    for (const e of tr.events) p.push(e, 0);
+    p.seek(tr.events[tr.events.length - 1].t_ns);
+    const sd = p.snapshot().steps[0];
+    expect(sd.nodes.length + sd.lens.length + sd.heads.length).toBe(0);
+    expect(sd.ops.length).toBeGreaterThan(0);
+  });
+
+  it('stepUntil(node) advances one graph node at a time', () => {
+    const p = loaded();
+    const firstStep = tr.events.find((e) => e.type === 'decode.step.start')!;
+    p.seek(firstStep.t_ns - 1);
+    p.stepUntil('node');
+    let r = runUntilPaused(p, 0);
+    expect(r.vm.steps[0].nodes.map((n) => n.i)).toEqual([0]);
+    p.stepUntil('node');
+    r = runUntilPaused(p, r.now + FRAME);
+    expect(r.vm.steps[0].nodes.map((n) => n.i)).toEqual([0, 1]);
+  });
+});

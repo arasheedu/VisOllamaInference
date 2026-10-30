@@ -48,6 +48,18 @@ export interface OpState {
   wall: number;
 }
 
+export interface NodeState {
+  layer: number;
+  i: number;
+  name: string;
+  op: string;
+  shape: number[];
+  ms: number;
+  src?: number[];
+  stats?: { min: number; max: number; mean: number; rms: number };
+  wall: number;
+}
+
 export type SampleStageEvent = EventOf<'decode.sample.stage'>;
 
 export interface StepDetail {
@@ -63,6 +75,17 @@ export interface StepDetail {
   kvWrites: Array<{ layer: number; pos: number; wall: number }>;
   samplingStages: Array<SampleStageEvent & { wall: number }>;
   layerMs: Array<{ layer: number; ms: number }>;
+  /** deep tier: graph nodes of each layer, in arrival order */
+  nodes: NodeState[];
+  /** deep tier: logit lens per layer */
+  lens: Array<{
+    layer: number;
+    top: Array<{ id: number; p: number; text?: string }>;
+    entropy?: number;
+    wall: number;
+  }>;
+  /** deep tier: per-head attention rows per layer */
+  heads: Array<{ layer: number; from: number; nKvHead?: number; rows: number[][]; wall: number }>;
   /** MoE routing per layer (MoE models only) */
   moe: Array<{ layer: number; experts: Array<{ id: number; w: number }>; wall: number }>;
   stepMs?: number;

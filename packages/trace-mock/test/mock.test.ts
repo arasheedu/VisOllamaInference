@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseEvent, serializeEvent, type TraceEvent } from 'trace-schema';
+import { parseEvent, serializeEvent, validateEventObject, type TraceEvent } from 'trace-schema';
 import { BpeTokenizer } from 'tokenizer';
 import { generateTrace, playItems, Utf8Assembler, mockTokenizer } from '../src';
 
@@ -92,4 +92,31 @@ describe('replay timing', () => {
     });
     expect(Math.max(...errs)).toBeLessThan(5);
   }, 10_000);
+});
+
+describe('deep tier', () => {
+  it('emits valid deep events and leaves lower tiers unchanged', () => {
+    const deep = generateTrace({ layers: 6, detail: 'deep', responseTokens: 14, seed: 3 });
+    const full = generateTrace({ layers: 6, detail: 'full', responseTokens: 14, seed: 3 });
+    for (const e of deep.events) expect(validateEventObject(e).ok).toBe(true);
+    const types = new Set(deep.events.map((e) => e.type));
+    for (const t of ['decode.node', 'decode.lens', 'decode.attn.heads'])
+      expect(types.has(t as never)).toBe(true);
+    // deep events only on steps < 3 and every 12th step
+    const deepSteps = new Set(
+      deep.events.filter((e) => e.type === 'decode.lens').map((e) => (e as { step: number }).step),
+    );
+    expect([...deepSteps].sort((a, b) => a - b)).toEqual([0, 1, 2, 12]);
+    const strip = (es: typeof deep.events) =>
+      es
+        .filter(
+          (e) =>
+            !['decode.node', 'decode.lens', 'decode.attn.heads', 'request.received'].includes(
+              e.type,
+            ),
+        )
+        .map(({ seq: _s, t_ns: _t, req: _r, ...x }) => JSON.stringify(x));
+    expect(strip(deep.events)).toEqual(strip(full.events));
+    expect(deep.responseText).toBe(full.responseText);
+  });
 });

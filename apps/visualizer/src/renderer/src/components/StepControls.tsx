@@ -1,3 +1,4 @@
+import { atLeast } from 'trace-schema';
 import { session } from '../session';
 import { useUi } from '../store';
 
@@ -14,6 +15,15 @@ export function StepControls() {
       >
         Step token
       </button>
+      {detail === 'deep' && (
+        <button
+          disabled={!hasRun}
+          onClick={() => session.step('node')}
+          title="Play until the next operation inside the layer"
+        >
+          Step op
+        </button>
+      )}
       <button
         disabled={!hasRun || detail === 'basic'}
         onClick={() => session.step('layer')}
@@ -22,7 +32,7 @@ export function StepControls() {
         Step layer
       </button>
       <button
-        disabled={!hasRun || detail !== 'full'}
+        disabled={!hasRun || !atLeast(detail, 'full')}
         onClick={() => session.step('sample')}
         title="Play until the next sampler stage"
       >

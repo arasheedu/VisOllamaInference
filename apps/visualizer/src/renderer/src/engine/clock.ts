@@ -11,6 +11,8 @@ export interface StageMinimums {
   'decode.op': number;
   'decode.attn': number;
   'decode.sample.stage': number;
+  /** deep tier: one graph node */
+  'decode.node': number;
   'tokenize.merge': number;
   'stream.chunk': number;
 }
@@ -24,6 +26,7 @@ export const DEFAULT_MINIMUMS: StageMinimums = {
   'decode.op': 25,
   'decode.attn': 60,
   'decode.sample.stage': 250,
+  'decode.node': 6,
   'tokenize.merge': 60,
   'stream.chunk': 40,
 };
@@ -87,6 +90,8 @@ export function defaultHold(
       return { kind: 'sub', ms: m['decode.attn'] };
     case 'decode.sample.stage':
       return { kind: 'sub', ms: m['decode.sample.stage'] };
+    case 'decode.node':
+      return { kind: 'sub', ms: m['decode.node'] ?? 6 };
     case 'tokenize.merge':
       return { kind: 'sub', ms: m['tokenize.merge'] };
     case 'stream.chunk':

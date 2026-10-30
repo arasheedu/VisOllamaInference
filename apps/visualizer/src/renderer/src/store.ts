@@ -50,6 +50,10 @@ export interface UiState {
   viewing: 'live' | 'file' | 'external' | null;
   fileName: string | null;
   fps: number;
+  /** deep view: pinned layer (null = follow the running layer) */
+  deepLayer: number | null;
+  /** deep detail: which view fills the middle panel */
+  deepTab: 'layer' | 'forward';
 }
 
 export const useUi = create<UiState>(() => ({
@@ -72,6 +76,8 @@ export const useUi = create<UiState>(() => ({
   viewing: null,
   fileName: null,
   fps: 0,
+  deepLayer: null,
+  deepTab: 'layer',
 }));
 
 export const setUi = useUi.setState;
@@ -83,4 +89,4 @@ export function clearWarning(id: string) {
   setUi((s) => ({ warnings: s.warnings.filter((x) => x.id !== id) }));
 }
 
-export const detailRankOf = (d: DetailLevel) => ({ basic: 0, layers: 1, full: 2 })[d];
+export const detailRankOf = (d: DetailLevel) => ({ basic: 0, layers: 1, full: 2, deep: 3 })[d];

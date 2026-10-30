@@ -97,3 +97,41 @@ test('Full detail + step mode: step one token through layers and sampling stages
     await app.close();
   }
 });
+
+test('Deep detail: step ops inside a layer, logit lens and per-head attention render', async () => {
+  const { app, page } = await launch({
+    port: PORT + 2,
+    settings: { source: 'mock', detail: 'deep', autosave: false, stepGranularity: 'layer' },
+  });
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  try {
+    await page.selectOption('[data-testid=model]', 'mock-llama:1b');
+    await page.check('[data-testid=step-mode]');
+    await page.click('[data-testid=run]');
+    await expect
+      .poll(() => page.evaluate(() => (window as any).__viz.useUi.getState().vm.phase), {
+        timeout: 30_000,
+      })
+      .toMatch(/prefill|decoding/);
+    const nodes = () =>
+      page.evaluate(() => (window as any).__viz.useUi.getState().vm.stepDetail?.nodes.length ?? 0);
+    await page.getByRole('button', { name: 'Step op' }).click();
+    await expect.poll(nodes, { timeout: 10_000 }).toBe(1);
+    await page.getByRole('button', { name: 'Step op' }).click();
+    await expect.poll(nodes, { timeout: 10_000 }).toBe(2);
+    for (let i = 0; i < 3; i++) await page.getByRole('button', { name: 'Step layer' }).click();
+    await expect(page.locator('[data-testid=block-diagram] .deep-node.ran').first()).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(page.locator('[data-testid=logit-lens] .deep-lens-tok').first()).toBeVisible();
+    await expect(page.locator('[data-testid=attn-heads] canvas')).toBeVisible();
+    await page.getByRole('button', { name: 'Continue' }).click();
+    await expect(page.locator('[data-testid=pipeline]')).toHaveAttribute('data-phase', 'done', {
+      timeout: 120_000,
+    });
+    expect(errors).toEqual([]);
+  } finally {
+    await app.close();
+  }
+});

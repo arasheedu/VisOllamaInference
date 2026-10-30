@@ -76,6 +76,9 @@ function emptyStep(step: number): StepDetail {
     samplingStages: [],
     layerMs: [],
     moe: [],
+    nodes: [],
+    lens: [],
+    heads: [],
   };
 }
 
@@ -341,6 +344,29 @@ export class InferenceStateMachine {
         this.updateStep(e.step, (sd) => ({
           ...sd,
           moe: [...sd.moe, { layer: e.layer, experts: e.experts, wall }],
+        }));
+        break;
+      case 'decode.node': {
+        const { step, layer, i, name, op, shape, ms, src, stats } = e;
+        this.updateStep(step, (sd) => ({
+          ...sd,
+          nodes: [...sd.nodes, { layer, i, name, op, shape, ms, src, stats, wall }],
+        }));
+        break;
+      }
+      case 'decode.lens':
+        this.updateStep(e.step, (sd) => ({
+          ...sd,
+          lens: [...sd.lens, { layer: e.layer, top: e.top, entropy: e.entropy, wall }],
+        }));
+        break;
+      case 'decode.attn.heads':
+        this.updateStep(e.step, (sd) => ({
+          ...sd,
+          heads: [
+            ...sd.heads,
+            { layer: e.layer, from: e.from, nKvHead: e.n_kv_head, rows: e.rows, wall },
+          ],
         }));
         break;
       case 'step.timeout':

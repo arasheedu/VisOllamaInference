@@ -1,4 +1,5 @@
 import {
+  atLeast,
   EVENT_DETAIL,
   PRIORITY,
   includedAtDetail,
@@ -9,12 +10,13 @@ import { DEFAULT_CLOCK_CONFIG, PlaybackClock, type ClockConfig, type ClockSource
 import { InferenceStateMachine } from './stateMachine';
 import type { ClockState, ViewModel } from './types';
 
-export type StepKind = 'token' | 'layer' | 'sample';
+export type StepKind = 'token' | 'layer' | 'sample' | 'node';
 
 export const STEP_PREDICATES: Record<StepKind, (e: TraceEvent) => boolean> = {
   token: (e) => e.type === 'decode.token' || e.type === 'request.done',
   layer: (e) => e.type === 'decode.layer' || e.type === 'request.done',
   sample: (e) => e.type === 'decode.sample.stage' || e.type === 'request.done',
+  node: (e) => e.type === 'decode.node' || e.type === 'request.done',
 };
 
 export interface PlayerOptions {
@@ -46,17 +48,17 @@ export class Player implements ClockSource {
     readonly req: string,
     o: PlayerOptions = {},
   ) {
-    this.capacity = o.capacity ?? 50_000;
+    this.capacity = o.capacity ?? 200_000;
     this.detail = o.detail ?? 'full';
     this.clock = new PlaybackClock(o.clock ?? DEFAULT_CLOCK_CONFIG);
     this.clock.live = o.live ?? true;
-    this.clock.fullDetail = this.detail === 'full';
-    this.clock.isFullTier = (e) => EVENT_DETAIL[e.type] === 'full';
+    this.clock.fullDetail = atLeast(this.detail, 'full');
+    this.clock.isFullTier = (e) => atLeast(EVENT_DETAIL[e.type], 'full');
   }
 
   setDetail(d: DetailLevel) {
     this.detail = d;
-    this.clock.fullDetail = d === 'full';
+    this.clock.fullDetail = atLeast(d, 'full');
   }
 
   /** Accepts whether the event type is wanted at the current detail level. */

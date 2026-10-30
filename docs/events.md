@@ -21,7 +21,7 @@ priority **critical** · detail ≥ **basic**
 | `model` | `string` | yes |
 | `prompt_chars` | `int` | yes |
 | `options` | `object` | no |
-| `detail` | `"basic" \| "layers" \| "full"` | no |
+| `detail` | `"basic" \| "layers" \| "full" \| "deep"` | no |
 | `capabilities` | `Array<string>` | no |
 
 ## `model.load`
@@ -242,6 +242,45 @@ priority **droppable** · detail ≥ **full**
 | `step` | `int` | yes |
 | `layer` | `int` | yes |
 | `experts` | `Array<{ id: int, w: number }>` | yes |
+
+## `decode.node`
+
+priority **droppable** · detail ≥ **deep**
+
+| field | type | required |
+|---|---|---|
+| `step` | `int` | yes |
+| `layer` | `int` | yes |
+| `i` | `int` | yes |
+| `name` | `string` | yes |
+| `op` | `string` | yes |
+| `shape` | `Array<int>` | yes |
+| `ms` | `number` | yes |
+| `src` | `Array<int>` | no |
+| `stats` | `{ min: number, max: number, mean: number, rms: number }` | no |
+
+## `decode.lens`
+
+priority **droppable** · detail ≥ **deep**
+
+| field | type | required |
+|---|---|---|
+| `step` | `int` | yes |
+| `layer` | `int` | yes |
+| `top` | `Array<{ id: int, p: number, text?: string }>` | yes |
+| `entropy` | `number` | no |
+
+## `decode.attn.heads`
+
+priority **droppable** · detail ≥ **deep**
+
+| field | type | required |
+|---|---|---|
+| `step` | `int` | yes |
+| `layer` | `int` | yes |
+| `from` | `int` | yes |
+| `n_kv_head` | `int` | no |
+| `rows` | `Array<Array<number>>` | yes |
 
 ## Control: `ack` (app → producer)
 

@@ -18,7 +18,7 @@ const base = {
 const tokenRef = z.object({ id: z.number().int(), text: z.string() });
 const candidate = z.object({ id: z.number().int(), text: z.string(), p: z.number() });
 
-export const DETAIL_LEVELS = ['basic', 'layers', 'full'] as const;
+export const DETAIL_LEVELS = ['basic', 'layers', 'full', 'deep'] as const;
 export const DetailLevel = z.enum(DETAIL_LEVELS);
 export type DetailLevel = z.infer<typeof DetailLevel>;
 
@@ -180,6 +180,42 @@ export const DecodeMoe = ev('decode.moe', {
   layer: z.number().int().nonnegative(),
   experts: z.array(z.object({ id: z.number().int().nonnegative(), w: z.number() })),
 });
+// ---- Deep tier (step mode; see docs/deep-tier.md) -------------------------
+
+/** One graph node of a decode layer, in execution order. */
+export const DecodeNode = ev('decode.node', {
+  step: z.number().int().nonnegative(),
+  layer: z.number().int().nonnegative(),
+  /** index within the layer, execution order */
+  i: z.number().int().nonnegative(),
+  /** llama.cpp tensor name without the -<layer> suffix, e.g. "Qcur" */
+  name: z.string().min(1),
+  /** ggml op, e.g. "MUL_MAT" */
+  op: z.string().min(1),
+  shape: z.array(z.number().int().nonnegative()),
+  ms: z.number().nonnegative(),
+  /** indices (i) of sources that are nodes of this layer */
+  src: z.array(z.number().int().nonnegative()).optional(),
+  stats: z
+    .object({ min: z.number(), max: z.number(), mean: z.number(), rms: z.number() })
+    .optional(),
+});
+/** Logit lens: the residual after `layer` projected through the output head. */
+export const DecodeLens = ev('decode.lens', {
+  step: z.number().int().nonnegative(),
+  layer: z.number().int().nonnegative(),
+  top: z.array(z.object({ id: z.number().int(), p: z.number(), text: z.string().optional() })),
+  entropy: z.number().optional(),
+});
+/** Per-head attention rows: rows[h][j] = weight of head h on KV position from + j. */
+export const DecodeAttnHeads = ev('decode.attn.heads', {
+  step: z.number().int().nonnegative(),
+  layer: z.number().int().nonnegative(),
+  from: z.number().int().nonnegative(),
+  n_kv_head: z.number().int().positive().optional(),
+  rows: z.array(z.array(z.number())),
+});
+
 /** Emitted by the runner when a step-mode wait expired without an ack. */
 export const StepTimeout = ev('step.timeout', {
   step: z.number().int().nonnegative(),
@@ -209,6 +245,9 @@ export const TraceEvent = z.discriminatedUnion('type', [
   StreamChunk,
   StepTimeout,
   DecodeMoe,
+  DecodeNode,
+  DecodeLens,
+  DecodeAttnHeads,
 ]);
 export type TraceEvent = z.infer<typeof TraceEvent>;
 export type EventType = TraceEvent['type'];
@@ -242,6 +281,9 @@ export const PRIORITY: Record<EventType, Priority> = {
   'stream.chunk': 'droppable',
   'step.timeout': 'critical',
   'decode.moe': 'droppable',
+  'decode.node': 'droppable',
+  'decode.lens': 'droppable',
+  'decode.attn.heads': 'droppable',
 };
 
 /** Minimum detail level at which each event type is emitted / consumed. */
@@ -268,9 +310,15 @@ export const EVENT_DETAIL: Record<EventType, DetailLevel> = {
   'stream.chunk': 'full',
   'step.timeout': 'basic',
   'decode.moe': 'full',
+  'decode.node': 'deep',
+  'decode.lens': 'deep',
+  'decode.attn.heads': 'deep',
 };
 
 export const detailRank = (d: DetailLevel): number => DETAIL_LEVELS.indexOf(d);
+/** True when detail level d includes everything at level `min`. */
+export const atLeast = (d: DetailLevel | null | undefined, min: DetailLevel): boolean =>
+  d != null && detailRank(d) >= detailRank(min);
 export const includedAtDetail = (type: EventType, d: DetailLevel): boolean =>
   detailRank(EVENT_DETAIL[type]) <= detailRank(d);
 

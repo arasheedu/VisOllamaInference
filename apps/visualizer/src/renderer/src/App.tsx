@@ -10,6 +10,8 @@ import { DebugPanel, Inspector, SettingsModal, Tour, Warnings } from './componen
 import { LayerCanvas } from './viz/LayerCanvas';
 import { ForwardPass } from './viz/ForwardPass';
 import { MoePanel } from './components/MoePanel';
+import { DeepView } from './components/DeepView';
+import { atLeast } from 'trace-schema';
 import { setUi, useUi } from './store';
 import { useReducedMotion } from './theme';
 import { dilationLabel } from './components/Timeline';
@@ -29,7 +31,7 @@ function CenterBadges() {
       )}
       {c.degraded && <span className="badge hot">fast-forwarding</span>}
       {c.catchingUp && <span className="badge hot">catch-up {c.speed.toFixed(1)}×</span>}
-      {detail === 'full' && !c.paused && (
+      {atLeast(detail, 'full') && !c.paused && (
         <span className="badge">slow motion {dilationLabel(c.dilation)}</span>
       )}
     </div>
@@ -39,6 +41,7 @@ function CenterBadges() {
 export function App() {
   const detail = useUi((s) => s.settings.detail);
   const inspector = useUi((s) => s.inspector);
+  const deepTab = useUi((s) => s.deepTab);
   const reduced = useReducedMotion();
   const kvLabel = useUi((s) => (s.vm.kv.total ? `KV ${s.vm.kv.used}/${s.vm.kv.total}` : ''));
 
@@ -66,24 +69,52 @@ export function App() {
           </div>
           <div className="panel" data-testid="layers-panel">
             <h3>
-              {detail === 'full'
-                ? 'Forward pass · attention · residual · KV cache'
-                : 'Layer stack · KV cache'}
+              {detail === 'deep' && deepTab === 'layer'
+                ? 'Inside a layer · logit lens · attention heads'
+                : atLeast(detail, 'full')
+                  ? 'Forward pass · attention · residual · KV cache'
+                  : 'Layer stack · KV cache'}
+              {detail === 'deep' && (
+                <span className="seg deep-tabs" style={{ marginLeft: 8 }}>
+                  <button
+                    className={deepTab === 'layer' ? 'on' : ''}
+                    onClick={() => setUi({ deepTab: 'layer' })}
+                    data-testid="deep-tab-layer"
+                  >
+                    Layer zoom
+                  </button>
+                  <button
+                    className={deepTab === 'forward' ? 'on' : ''}
+                    onClick={() => setUi({ deepTab: 'forward' })}
+                    data-testid="deep-tab-forward"
+                  >
+                    Forward pass
+                  </button>
+                </span>
+              )}
               <span className="spacer" />
               <span className="mono" style={{ textTransform: 'none' }}>
                 {kvLabel}
               </span>
             </h3>
             <div className="panel-body">
-              {detail === 'full' ? <ForwardPass /> : <LayerCanvas />}
+              {detail === 'deep' && deepTab === 'layer' ? (
+                <DeepView />
+              ) : atLeast(detail, 'full') ? (
+                <ForwardPass />
+              ) : (
+                <LayerCanvas />
+              )}
               <CenterBadges />
-              {detail === 'full' && <MoePanel />}
+              {atLeast(detail, 'full') && !(detail === 'deep' && deepTab === 'layer') && (
+                <MoePanel />
+              )}
             </div>
           </div>
           <div className="panel">
-            <h3>{detail === 'full' ? 'Sampling chain' : 'Sampling · top-k'}</h3>
+            <h3>{atLeast(detail, 'full') ? 'Sampling chain' : 'Sampling · top-k'}</h3>
             <div className="panel-body">
-              {detail === 'full' ? <SamplingFunnel /> : <SamplingPanel />}
+              {atLeast(detail, 'full') ? <SamplingFunnel /> : <SamplingPanel />}
             </div>
           </div>
           {inspector && <Inspector />}

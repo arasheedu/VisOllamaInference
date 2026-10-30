@@ -80,10 +80,12 @@ export function TopBar() {
             onClick={() => {
               void session.updateSettings({ detail: d });
               session.active?.setDetail(d);
+              // deep data is meant to be walked through one op at a time
+              if (d === 'deep') setUi({ stepMode: true });
             }}
             data-testid={`detail-${d}`}
           >
-            {d === 'basic' ? 'Basic' : d === 'layers' ? 'Layers' : 'Full'}
+            {d === 'basic' ? 'Basic' : d === 'layers' ? 'Layers' : d === 'full' ? 'Full' : 'Deep'}
           </button>
         ))}
       </div>
