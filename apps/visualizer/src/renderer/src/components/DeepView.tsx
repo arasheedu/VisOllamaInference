@@ -81,6 +81,10 @@ const OP_CAPTION: Record<string, string> = {
   SOFT_MAX: 'softmax',
   FLASH_ATTN_EXT: 'flash attention',
   GLU: 'gated activation',
+  SWIGLU: 'SwiGLU (gate · up)',
+  GEGLU: 'GeGLU (gate · up)',
+  SILU: 'SiLU',
+  GELU: 'GELU',
   UNARY: 'activation',
   SET_ROWS: 'write KV cache',
   CPY: 'copy to KV cache',
@@ -174,33 +178,63 @@ function layoutLayer(nodes: Skel[], MAX_COLS: number) {
 }
 
 /** Last complete layer structure seen per model, so a layer can be drawn before it runs. */
-const skeletons = new Map<string, Skel[]>();
+const skeletons = new Map<string, { base: Skel[]; byLayer: Map<number, Skel[]> }>();
 
-function useSkeleton(sd: StepDetail, layerNodes: NodeState[]): Skel[] {
+const toSkel = (m: Map<number, NodeState>): Skel[] =>
+  [...m.values()]
+    .sort((x, y) => x.i - y.i)
+    .map(({ i, name, op, shape, src }) => ({ i, name, op, shape, src }));
+
+/**
+ * The full graph of a layer, so ops that haven't run yet can be drawn dimmed.
+ * Remembered per layer (the last layer can differ, e.g. extra GET_ROWS nodes)
+ * with layer 0's graph as the default for layers not seen complete yet.
+ */
+function useSkeleton(sd: StepDetail, layer: number, layerNodes: NodeState[]): Skel[] {
   const model = useUi((s) => s.vm.model) ?? '';
   return useMemo(() => {
+    let cache = skeletons.get(model);
+    if (!cache) skeletons.set(model, (cache = { base: [], byLayer: new Map() }));
     const perLayer = new Map<number, Map<number, NodeState>>();
     for (const n of sd.nodes) {
       let m = perLayer.get(n.layer);
       if (!m) perLayer.set(n.layer, (m = new Map()));
       m.set(n.i, n);
     }
-    let best: Skel[] = skeletons.get(model) ?? [];
-    for (const m of perLayer.values())
-      if (m.size > best.length)
-        best = [...m.values()].map(({ i, name, op, shape, src }) => ({ i, name, op, shape, src }));
-    if (best.length) skeletons.set(model, best);
-    // nodes this layer has that the skeleton lacks (another architecture) win
-    if (layerNodes.length > best.length) return layerNodes;
-    return best;
-  }, [sd.nodes, layerNodes, model]);
+    for (const [l, m] of perLayer) {
+      const prev = cache.byLayer.get(l);
+      if (!prev || m.size >= prev.length) cache.byLayer.set(l, toSkel(m));
+    }
+    if (!cache.base.length || (perLayer.get(0)?.size ?? 0) >= cache.base.length) {
+      const l0 = perLayer.get(0);
+      if (l0) cache.base = toSkel(l0);
+    }
+    const own = cache.byLayer.get(layer) ?? [];
+    const cand = own.length >= cache.base.length ? own : cache.base;
+    // use what actually ran when it diverges from the remembered graph
+    const fits = layerNodes.every((n) => {
+      const k = cand.find((c) => c.i === n.i);
+      return k && k.name === n.name && k.op === n.op;
+    });
+    return fits && cand.length >= layerNodes.length ? cand : layerNodes;
+  }, [sd.nodes, layer, layerNodes, model]);
+}
+
+/** Readable label: llama.cpp leaves the KV-cache stores unnamed. */
+function labelOf(n: Skel, byI: Map<number, Skel>): string {
+  if (n.op === 'SET_ROWS' || n.name === 'set_rows' || n.name === 'cpy') {
+    const src = byI.get(n.src?.[0] ?? -1)?.name ?? '';
+    if (src.startsWith('K')) return 'K → cache';
+    if (src.startsWith('V')) return 'V → cache';
+  }
+  return n.name;
 }
 
 // ---- block diagram -----------------------------------------------------------
 
 function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
   const nodes = useMemo(() => sd.nodes.filter((n) => n.layer === layer), [sd.nodes, layer]);
-  const skel = useSkeleton(sd, nodes);
+  const skel = useSkeleton(sd, layer, nodes);
   const hasSkel = skel.length > 0;
   const wrap = useRef<HTMLDivElement>(null);
   const [area, setArea] = useState({ w: 800, h: 300 });
@@ -371,7 +405,7 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
                   />
                 )}
                 <text x={8} y={17} className="deep-node-name">
-                  {b.n.name}
+                  {labelOf(b.n, L.byI)}
                 </text>
                 <text x={8} y={31} className="deep-node-op">
                   {OP_CAPTION[b.n.op] ?? b.n.op.toLowerCase()}
@@ -388,7 +422,7 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
       {hover && hs && (
         <div className="tip" style={{ left: hover.x + 14, top: hover.y + 10 }}>
           <div className="mono">
-            {hs.name} · {hs.op}
+            {labelOf(hs, L.byI)} · {hs.op}
           </div>
           <div className="mono">shape {fmtShape(hs.shape)}</div>
           <div className="mono">{hn ? `${hn.ms.toFixed(4)} ms` : 'not run yet in this layer'}</div>
@@ -401,7 +435,10 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
           )}
           {!!hs.src?.length && (
             <div className="mono" style={{ color: 'var(--muted)' }}>
-              from {hs.src.map((s) => L.byI.get(s)?.name ?? `#${s}`).join(', ')}
+              from{' '}
+              {hs.src
+                .map((s) => (L.byI.get(s) ? labelOf(L.byI.get(s)!, L.byI) : `#${s}`))
+                .join(', ')}
             </div>
           )}
         </div>

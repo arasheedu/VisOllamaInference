@@ -1,0 +1,919 @@
+From 71e113c7addbc32ec8bf79271a09c7627f54d621 Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 23:31:08 -0700
+Subject: [PATCH 7/7] server: deep trace tier (graph nodes, logit lens,
+ per-head attention)
+
+[visualizer-trace] trace.deep (with detail "full") adds three events on every
+layer of each traced decode step:
+
+- decode.node: every non-view node of the layer, in execution order, with
+  name, op, shape, segment time, in-layer sources and min/max/mean/rms
+- decode.lens: l_out of the current token through output_norm + output,
+  softmaxed over the vocabulary (lens_topk tokens, entropy)
+- decode.attn.heads: softmaxed rows of every query head over the last
+  attn_window KV cells (FA rows rebuilt on the CPU as before)
+
+The lens runs as one graph for all layers after the pass, on the backend
+that holds the output head (llama_trace_logit_lens), or per layer before
+each pause in layer step mode. The FA rebuild now skips masked cells and
+converts K once per KV head, which also makes full detail cheaper.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ include/llama.h                |   7 +
+ src/llama-context.cpp          |  80 ++++++
+ src/llama-context.h            |  11 +
+ tools/server/server-schema.cpp |   2 +-
+ tools/server/server-trace.cpp  | 491 ++++++++++++++++++++++++++++-----
+ tools/server/server-trace.h    |  31 ++-
+ 6 files changed, 557 insertions(+), 65 deletions(-)
+
+diff --git a/include/llama.h b/include/llama.h
+index 0ab421b1d..3e3ba9727 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1132,6 +1132,13 @@ extern "C" {
+     // graphs. With no callback installed the scheduler computes each split in a single call.
+     LLAMA_API void llama_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data);
+ 
++    // [visualizer-trace] Logit lens: passes n_rows hidden-state rows (n_embd floats each, e.g. the l_out of every
++    // layer for one token) through the model's final norm and output head, and writes n_rows*n_vocab logits.
++    // Runs one small graph on the backend that holds the output weights, outside the scheduler: the KV cache and
++    // the logits of the last decode are untouched. n_rows == 0 only checks that the model has a usable head.
++    // Returns 0 on success, -1 if the model has no reachable output head, -2 if the compute failed.
++    LLAMA_API int32_t llama_trace_logit_lens(struct llama_context * ctx, const float * rows, int32_t n_rows, float * logits);
++
+     // Wait until all computations are finished
+     // This is automatically done when using one of the functions below to obtain the computation results
+     // and is not necessary to call it explicitly in most cases
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5bff79db0..cad18408a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1329,6 +1329,82 @@ void llama_context::set_eval_callback(ggml_backend_sched_eval_callback cb_eval,
+     ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
+ }
+ 
++// [visualizer-trace] logit lens: rows -> final norm -> output head, on the backend that holds the head.
++// Mirrors the llama-family tail (build_norm(output_norm[, output_norm_b]) + build_lora_mm(output, output_s)
++// + output_b); LoRA adapters, Hadamard-folded heads and arch-specific logit scaling are not applied.
++int32_t llama_context::trace_logit_lens(const float * rows, int32_t n_rows, float * logits) {
++    const auto & hp = model.hparams;
++
++    ggml_tensor * w  = model.output;
++    ggml_tensor * nw = model.output_norm;
++    if (!w || !nw || !w->buffer || !nw->buffer || w->ne[0] != (int64_t) hp.n_embd || nw->ne[0] != w->ne[0]) {
++        return -1;
++    }
++
++    if (!trace_lens_backend) {
++        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(w->buffer);
++        for (auto & b : backends) {
++            if (ggml_backend_supports_buft(b.get(), buft)) {
++                trace_lens_backend = b.get();
++                break;
++            }
++        }
++        if (!trace_lens_backend) {
++            return -1;
++        }
++        trace_lens_galloc.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(trace_lens_backend)));
++    }
++    if (n_rows <= 0) {
++        return 0;
++    }
++
++    if (n_rows != trace_lens_rows || !trace_lens_gf) {
++        const size_t n_nodes = 16;
++        ggml_init_params ip = {
++            /*.mem_size   =*/ ggml_tensor_overhead()*n_nodes + ggml_graph_overhead_custom(n_nodes, false),
++            /*.mem_buffer =*/ nullptr,
++            /*.no_alloc   =*/ true,
++        };
++        trace_lens_ctx.reset(ggml_init(ip));
++        ggml_context * c = trace_lens_ctx.get();
++
++        ggml_tensor * inp = ggml_new_tensor_2d(c, GGML_TYPE_F32, w->ne[0], n_rows);
++        ggml_set_input(inp);
++
++        ggml_tensor * cur = model.output_norm_b ? ggml_norm(c, inp, hp.f_norm_eps) : ggml_rms_norm(c, inp, hp.f_norm_rms_eps);
++        cur = ggml_mul(c, cur, nw);
++        if (model.output_norm_b) {
++            cur = ggml_add(c, cur, model.output_norm_b);
++        }
++        cur = ggml_mul_mat(c, w, cur);
++        if (model.output_s) {
++            cur = ggml_mul(c, cur, model.output_s);
++        }
++        if (model.output_b) {
++            cur = ggml_add(c, cur, model.output_b);
++        }
++        ggml_set_output(cur);
++
++        ggml_cgraph * gf = ggml_new_graph_custom(c, n_nodes, false);
++        ggml_build_forward_expand(gf, cur);
++        if (!ggml_gallocr_alloc_graph(trace_lens_galloc.get(), gf)) {
++            trace_lens_gf = nullptr;
++            return -2;
++        }
++        trace_lens_gf   = gf;
++        trace_lens_inp  = inp;
++        trace_lens_out  = cur;
++        trace_lens_rows = n_rows;
++    }
++
++    ggml_backend_tensor_set(trace_lens_inp, rows, 0, ggml_nbytes(trace_lens_inp));
++    if (ggml_backend_graph_compute(trace_lens_backend, trace_lens_gf) != GGML_STATUS_SUCCESS) {
++        return -2;
++    }
++    ggml_backend_tensor_get(trace_lens_out, logits, 0, ggml_nbytes(trace_lens_out));
++    return 0;
++}
++
+ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
+     LLAMA_LOG_DEBUG("%s: call\n", __func__);
+ 
+@@ -4231,6 +4307,10 @@ void llama_set_eval_callback(llama_context * ctx, ggml_backend_sched_eval_callba
+     ctx->set_eval_callback(cb_eval, cb_eval_user_data);
+ }
+ 
++int32_t llama_trace_logit_lens(llama_context * ctx, const float * rows, int32_t n_rows, float * logits) {
++    return ctx->trace_logit_lens(rows, n_rows, logits);
++}
++
+ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
+     ctx->set_embeddings(embeddings);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 988f5e95a..275fc1de8 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -117,6 +117,7 @@ struct llama_context {
+ 
+     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+     void set_eval_callback(ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data); // [visualizer-trace]
++    int32_t trace_logit_lens(const float * rows, int32_t n_rows, float * logits); // [visualizer-trace]
+ 
+     void set_embeddings (bool value);
+     void set_embeddings_nextn(bool value, bool masked);
+@@ -432,6 +433,16 @@ private:
+     // true after the prism.hadamard coverage check passes on a reserved graph
+     bool hadamard_verified = false;
+ 
++    // [visualizer-trace] logit lens graph (trace_logit_lens), built once per row count and reused, so that
++    // backends that cache graphs (CUDA graphs are keyed by the first node) see the same graph every time
++    ggml_backend_t   trace_lens_backend = nullptr;
++    ggml_gallocr_ptr trace_lens_galloc;
++    ggml_context_ptr trace_lens_ctx;
++    ggml_cgraph *    trace_lens_gf   = nullptr;
++    ggml_tensor *    trace_lens_inp  = nullptr;
++    ggml_tensor *    trace_lens_out  = nullptr;
++    int32_t          trace_lens_rows = 0;
++
+     // perf
+     mutable int64_t t_start_us  = 0;
+     mutable int64_t t_load_us   = 0;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 774c64507..bb8d3a672 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -24,7 +24,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+ 
+     // [visualizer-trace]
+     add((new field_json("trace"))
+-        ->set_desc("Inference tracing for the visualizer: {detail, layer_stride, attn_layers, attn_topk, attn_heads, sample_topn, step, step_timeout_ms}. Events ride on the response chunks as __trace")
++        ->set_desc("Inference tracing for the visualizer: {detail, layer_stride, attn_layers, attn_topk, attn_heads, sample_topn, step, step_timeout_ms, deep, lens_topk, attn_window}. Events ride on the response chunks as __trace")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {
+             ctx.params.trace = server_trace_params::from_json(data.at("trace"));
+         }));
+diff --git a/tools/server/server-trace.cpp b/tools/server/server-trace.cpp
+index d6c204c6b..50f1590cd 100644
+--- a/tools/server/server-trace.cpp
++++ b/tools/server/server-trace.cpp
+@@ -12,6 +12,7 @@
+ #include <cstring>
+ #include <queue>
+ #include <stdexcept>
++#include <thread>
+ 
+ //
+ // helpers
+@@ -290,6 +291,13 @@ server_trace_params server_trace_params::from_json(const json & j) {
+     else if (step == "sample") p.step = SERVER_TRACE_STEP_SAMPLE;
+     else if (step == "token")  p.step = SERVER_TRACE_STEP_NONE; // token granularity is handled by the client
+     else throw std::invalid_argument("step must be null, \"layer\" or \"sample\"");
++
++    p.deep        =             json_value(j, "deep",        p.deep);
++    p.lens_topk   = std::clamp(json_value(j, "lens_topk",   p.lens_topk),   1, 100);
++    p.attn_window = std::clamp(json_value(j, "attn_window", p.attn_window), 1, 1 << 20);
++    if (p.deep && p.detail != SERVER_TRACE_FULL) {
++        throw std::invalid_argument("deep requires detail \"full\"");
++    }
+     return p;
+ }
+ 
+@@ -330,7 +338,15 @@ void server_trace::start(const server_trace_params & params, int32_t id_slot, ll
+     this->id_slot  = id_slot;
+     this->flush_fn = std::move(flush_fn);
+     this->alive_fn = std::move(alive_fn);
+-    n_layer = llama_model_n_layer(llama_get_model(ctx));
++    this->ctx      = ctx;
++    const llama_model * model = llama_get_model(ctx);
++    n_layer   = llama_model_n_layer(model);
++    n_head_kv = llama_model_n_head_kv(model);
++    n_embd    = llama_model_n_embd(model);
++    n_vocab   = llama_vocab_n_tokens(llama_model_get_vocab(model));
++    saw_layers  = false;
++    lens_failed = false;
++    lens_ok     = p.deep && llama_trace_logit_lens(ctx, nullptr, 0, nullptr) == 0;
+     {
+         events    = json::array();
+         caps_sent = false;
+@@ -394,6 +410,12 @@ server_trace_payload server_trace::take() {
+         if (step_busy) {
+             caps.push_back("no_step"); // another request holds step mode
+         }
++        if (p.deep && !lens_ok) {
++            caps.push_back("no_lens"); // no output head the lens can reach
++        }
++        if (p.deep && !saw_layers) {
++            caps.push_back("no_nodes"); // graph nodes are not named <name>-<il>
++        }
+         res.caps    = std::move(caps);
+         res.id_slot = id_slot;
+     }
+@@ -483,6 +505,15 @@ void server_trace::before_decode(llama_context * ctx, bool prefill, int32_t step
+     row_prev.clear();
+     moe_ids.clear();
+     moe_w.clear();
++    deep_layer      = -1;
++    deep_list_layer = -1;
++    deep_nodes.clear();
++    deep_cur        = nullptr;
++    op_pending      = 0.0;
++    if (p.deep) {
++        lens_rows.assign((size_t) n_layer*n_embd, 0.0f);
++        lens_have.assign(n_layer, 0);
++    }
+ 
+     if (prefill) {
+         if (t_prefill == 0) {
+@@ -505,6 +536,18 @@ void server_trace::after_decode(llama_context * ctx) {
+         llama_set_eval_callback(ctx, nullptr, nullptr);
+         g_installed = nullptr;
+     }
++    // deep: logit lens of every layer in one graph, after the pass (step mode runs it per layer instead)
++    if (p.deep && observe && !prefill && lens_ok) {
++        int first = -1;
++        for (int il = 0; il < n_layer; ++il) {
++            if (lens_have[il]) {
++                first = first < 0 ? il : first;
++            }
++        }
++        if (first >= 0) {
++            lens_run(first, n_layer - first);
++        }
++    }
+ }
+ 
+ void server_trace::prefill_done() {
+@@ -549,46 +592,78 @@ bool server_trace::eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+ 
+     char base[GGML_MAX_NAME];
+     int  il = -1;
+-    if (!trace_parse_name(t->name, base, sizeof(base), il)) {
+-        if (t->op != GGML_OP_FLASH_ATTN_EXT) {
++    const bool named = trace_parse_name(t->name, base, sizeof(base), il);
++    const bool deep  = tr->p.deep && !tr->prefill;
++    if (!named) {
++        base[0] = '\0';
++        il      = -1;
++        if (t->op != GGML_OP_FLASH_ATTN_EXT && !deep) {
+             return ask ? false : true;
+         }
+-        base[0] = '\0';
+     }
+     if (t->op == GGML_OP_FLASH_ATTN_EXT && il < 0) {
+         il = tr->cur_layer; // the fused attention node is unnamed; it belongs to the layer being built
+     }
++    const bool tracked = named || t->op == GGML_OP_FLASH_ATTN_EXT; // the full-detail logic knows this node
+ 
+     if (ask) {
+-        if (il >= 0) {
+-            tr->cur_layer = il;
+-            if (il == 0 && !tr->in_ub) {
+-                // first node of a new ubatch (the scheduler asks before it computes)
+-                tr->in_ub   = true;
+-                tr->ub_i   += tr->prefill ? 1 : 0;
+-                tr->t_ub    = trace_now_ns();
+-                tr->t_last  = tr->t_ub;
+-                tr->t_layer = tr->t_ub;
++        bool need = false;
++        if (tracked) {
++            if (il >= 0) {
++                tr->cur_layer  = il;
++                tr->saw_layers = true;
++                if (il == 0 && !tr->in_ub) {
++                    // first node of a new ubatch (the scheduler asks before it computes)
++                    tr->in_ub   = true;
++                    tr->ub_i   += tr->prefill ? 1 : 0;
++                    tr->t_ub    = trace_now_ns();
++                    tr->t_last  = tr->t_ub;
++                    tr->t_layer = tr->t_ub;
++                }
++                if (il == 0 && strcmp(base, "l_out") == 0) {
++                    tr->ub_ntok = (int32_t) t->ne[1];
++                }
+             }
+-            if (il == 0 && strcmp(base, "l_out") == 0) {
+-                tr->ub_ntok = (int32_t) t->ne[1];
++            // the layer runs where its weights are: the first weight matmul of the layer decides (the
++            // scheduler may still put weight-less ops such as the residual add on a neighbouring GPU)
++            if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && !tr->layer_dev && tr->cur_layer >= 0 &&
++                    t->src[0] && t->src[0]->buffer && ggml_backend_buffer_get_usage(t->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                tr->layer_dev = trace_device(t->src[0]);
+             }
++            if (t->op == GGML_OP_FLASH_ATTN_EXT) {
++                tr->attn = ATTN_FLASH;
++            } else if (strcmp(base, "kq_soft_max") == 0) {
++                tr->attn = ATTN_SOFTMAX;
++            }
++            need = tr->want(t, base, il);
+         }
+-        // the layer runs where its weights are: the first weight matmul of the layer decides (the
+-        // scheduler may still put weight-less ops such as the residual add on a neighbouring GPU)
+-        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && !tr->layer_dev && tr->cur_layer >= 0 &&
+-                t->src[0] && t->src[0]->buffer && ggml_backend_buffer_get_usage(t->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+-            tr->layer_dev = trace_device(t->src[0]);
+-        }
+-        if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+-            tr->attn = ATTN_FLASH;
+-        } else if (strcmp(base, "kq_soft_max") == 0) {
+-            tr->attn = ATTN_SOFTMAX;
++        if (deep) {
++            need = tr->deep_ask(t, named, il) || need;
+         }
+-        return tr->want(t, base, il);
++        return need;
+     }
+ 
+-    tr->on_observed(t, base, il);
++    const int64_t now = trace_now_ns();
++    const double  seg = ns_to_ms(now - tr->t_last);
++    tr->t_last = now;
++
++    if (!tr->prefill) {
++        // a decode segment is charged to the op of the node it ends at; at deep, segments that end at
++        // other nodes are carried to the next op node (as the unobserved nodes are at full)
++        const int op = tracked ? trace_op_of(t, base) : -1;
++        if (op >= 0) {
++            tr->ops[op]   += seg + tr->op_pending;
++            tr->op_pending = 0.0;
++        } else if (deep) {
++            tr->op_pending += seg;
++        }
++    }
++    if (deep && t == tr->deep_cur) {
++        tr->deep_node(t, base, seg);
++    }
++    if (tracked) {
++        tr->on_observed(t, base, il, now);
++    }
+ 
+     // do not charge our own readback / reduction time (or a step-mode wait) to the next segment
+     const int64_t spent = trace_now_ns() - tr->t_last;
+@@ -598,11 +673,7 @@ bool server_trace::eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+     return true; // keep computing
+ }
+ 
+-void server_trace::on_observed(ggml_tensor * t, const char * b, int il) {
+-    const int64_t now = trace_now_ns();
+-    const double  seg = ns_to_ms(now - t_last);
+-    t_last = now;
+-
++void server_trace::on_observed(ggml_tensor * t, const char * b, int il, int64_t now) {
+     const bool full = p.detail == SERVER_TRACE_FULL;
+ 
+     if (prefill) {
+@@ -634,10 +705,6 @@ void server_trace::on_observed(ggml_tensor * t, const char * b, int il) {
+     }
+ 
+     // decode
+-    const int op = trace_op_of(t, b);
+-    if (op >= 0) {
+-        ops[op] += seg;
+-    }
+ 
+     if (strcmp(b, "embd") == 0) {
+         trace_read_row(t, t->ne[1] - 1, 0, row_prev);
+@@ -647,7 +714,7 @@ void server_trace::on_observed(ggml_tensor * t, const char * b, int il) {
+         return;
+     }
+ 
+-    if (full && il % p.attn_layers == 0) {
++    if (full && (il % p.attn_layers == 0 || p.deep)) {
+         if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+             attn_flash(t, il);
+         } else if (strcmp(b, "kq_soft_max") == 0) {
+@@ -685,6 +752,10 @@ void server_trace::on_observed(ggml_tensor * t, const char * b, int il) {
+ 
+     if (full) {
+         if (trace_read_row(t, t->ne[1] - 1, 0, row_cur)) {
++            if (p.deep && (int32_t) row_cur.size() == n_embd && il < n_layer) {
++                std::copy(row_cur.begin(), row_cur.end(), lens_rows.begin() + (size_t) il*n_embd);
++                lens_have[il] = 1;
++            }
+             const float norm  = trace_l2(row_cur.data(), nullptr, row_cur.size());
+             const float delta = row_prev.size() == row_cur.size() ? trace_l2(row_cur.data(), row_prev.data(), row_cur.size()) : norm;
+             ev["norm"] = norm;
+@@ -735,8 +806,13 @@ void server_trace::on_observed(ggml_tensor * t, const char * b, int il) {
+         emit(std::move(ev));
+     }
+     std::fill(std::begin(ops), std::end(ops), 0.0);
++    op_pending = 0.0;
+ 
+     if (p.step == SERVER_TRACE_STEP_LAYER) {
++        if (p.deep && lens_ok && step_own && il < n_layer && lens_have[il]) {
++            lens_run(il, 1); // step mode: the lens of this layer before the pause
++            lens_have[il] = 0;
++        }
+         wait_step("layer");
+     }
+ }
+@@ -758,11 +834,11 @@ void server_trace::attn_softmax(ggml_tensor * t, int il) {
+         for (int64_t j = 0; j < n_kv; ++j) {
+             avg[j] += row[j] / n_head;
+         }
+-        if (p.attn_heads) {
++        if (p.attn_heads || p.deep) {
+             heads.push_back(row);
+         }
+     }
+-    attn_emit(il, avg, heads);
++    attn_emit(il, avg, heads, n_head_kv);
+ }
+ 
+ // flash attention: the softmaxed KQ row never exists, so rebuild it on the CPU for the current
+@@ -790,20 +866,43 @@ void server_trace::attn_flash(ggml_tensor * t, int il) {
+         scale /= softcap;
+     }
+ 
+-    // whole K view in one transfer, then convert row by row
++    // whole K view in one transfer, then convert the unmasked cells once per KV head
+     const auto * kt = ggml_get_type_traits(k->type);
+     if (k->type != GGML_TYPE_F32 && !kt->to_float) {
+         return;
+     }
+-    std::vector<uint8_t> kbuf(ggml_nbytes(k));
+-    ggml_backend_tensor_get(k, kbuf.data(), 0, kbuf.size());
+-
+     std::vector<float> mask;
+     if (m && !trace_read_row(m, tok, 0, mask)) {
+         mask.clear();
+     }
++    auto masked = [&](int64_t j) { return j < (int64_t) mask.size() && mask[j] == -INFINITY; };
++
++    // the view spans the whole n_kv (padded, up to the cache size): transfer only up to the last unmasked cell
++    int64_t n_used = n_kv;
++    while (n_used > 0 && masked(n_used - 1)) {
++        n_used--;
++    }
++    std::vector<uint8_t> kbuf(ggml_nbytes(k));
++    if (n_used > 0) {
++        ggml_backend_tensor_get(k, kbuf.data(), 0, std::min(ggml_nbytes(k), (size_t) ((n_used - 1)*k->nb[1] + (n_head_kv - 1)*k->nb[2] + ggml_row_size(k->type, d))));
++    }
++    std::vector<float> kf((size_t) n_head_kv*n_kv*d);
++    for (int64_t g = 0; g < n_head_kv; ++g) {
++        for (int64_t j = 0; j < n_used; ++j) {
++            if (masked(j)) {
++                continue; // other sequences' cells and the padding past the last used cell
++            }
++            const uint8_t * kp = kbuf.data() + j*k->nb[1] + g*k->nb[2];
++            float * dst = kf.data() + ((size_t) g*n_kv + j)*d;
++            if (k->type == GGML_TYPE_F32) {
++                memcpy(dst, kp, d*sizeof(float));
++            } else {
++                kt->to_float(kp, dst, d);
++            }
++        }
++    }
+ 
+-    std::vector<float> qrow, krow(d), s(n_kv), avg(n_kv, 0.0f);
++    std::vector<float> qrow, s(n_kv), avg(n_kv, 0.0f);
+     std::vector<uint8_t> qbuf;
+     trace_read_all(q, qbuf); // one transfer for all heads
+     std::vector<std::vector<float>> heads;
+@@ -814,12 +913,11 @@ void server_trace::attn_flash(ggml_tensor * t, int il) {
+         const int64_t g = h / (n_head / n_head_kv);
+         float s_max = -INFINITY;
+         for (int64_t j = 0; j < n_kv; ++j) {
+-            const uint8_t * kp = kbuf.data() + j*k->nb[1] + g*k->nb[2];
+-            if (k->type == GGML_TYPE_F32) {
+-                memcpy(krow.data(), kp, d*sizeof(float));
+-            } else {
+-                kt->to_float(kp, krow.data(), d);
++            if (masked(j)) {
++                s[j] = -INFINITY;
++                continue;
+             }
++            const float * krow = kf.data() + ((size_t) g*n_kv + j)*d;
+             double dot = 0.0;
+             for (int64_t i = 0; i < d; ++i) {
+                 dot += (double) qrow[i]*krow[i];
+@@ -835,6 +933,9 @@ void server_trace::attn_flash(ggml_tensor * t, int il) {
+             s_max = std::max(s_max, v);
+         }
+         if (!std::isfinite(s_max)) {
++            if (p.attn_heads || p.deep) {
++                heads.emplace_back(n_kv, 0.0f); // fully masked: keep the head index aligned
++            }
+             continue;
+         }
+         double sum = 0.0;
+@@ -846,14 +947,14 @@ void server_trace::attn_flash(ggml_tensor * t, int il) {
+             s[j] = (float) (s[j]/sum);
+             avg[j] += s[j]/n_head;
+         }
+-        if (p.attn_heads) {
++        if (p.attn_heads || p.deep) {
+             heads.push_back(s);
+         }
+     }
+-    attn_emit(il, avg, heads);
++    attn_emit(il, avg, heads, n_head_kv);
+ }
+ 
+-void server_trace::attn_emit(int il, const std::vector<float> & w_avg, const std::vector<std::vector<float>> & w_heads) {
++void server_trace::attn_emit(int il, const std::vector<float> & w_avg, const std::vector<std::vector<float>> & w_heads, int64_t n_kv_head) {
+     auto top = [&](const std::vector<float> & w) {
+         std::vector<int32_t> idx(w.size());
+         for (size_t i = 0; i < idx.size(); ++i) {
+@@ -867,18 +968,284 @@ void server_trace::attn_emit(int il, const std::vector<float> & w_avg, const std
+         }
+         return res;
+     };
+-    json ev = trace_ev("decode.attn");
++    if (il % p.attn_layers == 0) {
++        json ev = trace_ev("decode.attn");
++        ev["step"]  = step;
++        ev["layer"] = il;
++        ev["top"]   = top(w_avg);
++        emit(std::move(ev));
++        for (size_t h = 0; p.attn_heads && h < w_heads.size(); ++h) {
++            json he = trace_ev("decode.attn");
++            he["step"]  = step;
++            he["layer"] = il;
++            he["head"]  = (int) h;
++            he["top"]   = top(w_heads[h]);
++            emit(std::move(he));
++        }
++    }
++    if (p.deep && !w_heads.empty()) {
++        // the KV view is padded past the last used cell; trailing cells masked for every head are not
++        // positions of this sequence, so n_kv = last cell with weight > 0 in any head, + 1
++        size_t n_kv = 0;
++        for (const auto & w : w_heads) {
++            for (size_t j = w.size(); j > n_kv; --j) {
++                if (w[j - 1] > 0.0f) {
++                    n_kv = j;
++                    break;
++                }
++            }
++        }
++        const size_t from = n_kv > (size_t) p.attn_window ? n_kv - p.attn_window : 0;
++        json rows = json::array();
++        for (const auto & w : w_heads) {
++            json row = json::array();
++            for (size_t j = from; j < n_kv; ++j) {
++                row.push_back(j < w.size() ? std::round((double) w[j]*1e4)/1e4 : 0.0);
++            }
++            rows.push_back(std::move(row));
++        }
++        json ev = trace_ev("decode.attn.heads");
++        ev["step"]      = step;
++        ev["layer"]     = il;
++        ev["from"]      = (int64_t) from;
++        ev["n_kv_head"] = n_kv_head;
++        ev["rows"]      = std::move(rows);
++        emit(std::move(ev));
++    }
++}
++
++//
++// deep detail: every node of each decode layer, logit lens
++//
++
++// layer membership of a decode node: named nodes carry their layer, the others belong to the layer that
++// is open (nodes after l_out-<L> go to layer L+1; nodes before the first layer and after the last are
++// outside). View-only nodes are never observed, the scheduler computes them with the next segment.
++bool server_trace::deep_ask(const ggml_tensor * t, bool named, int il) {
++    deep_cur = nullptr;
++    const int L = (named && il >= 0) ? il : deep_layer;
++    if (named && il >= 0) {
++        deep_layer = il;
++    }
++    if (L < 0 || L >= n_layer) {
++        return false;
++    }
++    if (named && il >= 0 && strncmp(t->name, "l_out-", 6) == 0) {
++        deep_layer = il + 1 < n_layer ? il + 1 : -1; // close the layer
++    }
++    if (trace_is_view(t) || t->op == GGML_OP_NONE) {
++        return false;
++    }
++    if (L != deep_list_layer) {
++        deep_list_layer = L;
++        deep_nodes.clear();
++    }
++    deep_cur       = t;
++    deep_cur_layer = L;
++    return true;
++}
++
++static std::string trace_lower(const char * s) {
++    std::string r = s;
++    for (auto & c : r) {
++        c = (char) tolower((unsigned char) c);
++    }
++    return r;
++}
++
++// min/max/mean/rms over the result (decode: one token, so the whole tensor); false for results that alias
++// another buffer (SET_ROWS / CPY into the KV cache), non-float or non-contiguous results, and > 1M elements
++static bool trace_stats(const ggml_tensor * t, json & out) {
++    const int64_t n = ggml_nelements(t);
++    if (t->view_src || n <= 0 || n > (1 << 20) || !ggml_is_contiguous(t) ||
++            (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)) {
++        return false;
++    }
++    std::vector<uint8_t> raw(ggml_nbytes(t));
++    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
++    std::vector<float> v;
++    const float * x = (const float *) raw.data();
++    if (t->type != GGML_TYPE_F32) {
++        v.resize(n);
++        ggml_get_type_traits(t->type)->to_float(raw.data(), v.data(), n);
++        x = v.data();
++    }
++    double mn = INFINITY, mx = -INFINITY, sum = 0.0, sq = 0.0;
++    int64_t cnt = 0;
++    for (int64_t i = 0; i < n; ++i) {
++        const double a = x[i];
++        if (!std::isfinite(a)) {
++            continue; // e.g. masked scores; the stats are over the finite values
++        }
++        mn   = std::min(mn, a);
++        mx   = std::max(mx, a);
++        sum += a;
++        sq  += a*a;
++        cnt++;
++    }
++    if (cnt == 0) {
++        return false;
++    }
++    out = json{{"min", (float) mn}, {"max", (float) mx}, {"mean", (float) (sum/cnt)}, {"rms", (float) std::sqrt(sq/cnt)}};
++    return true;
++}
++
++void server_trace::deep_node(const ggml_tensor * t, const char * base, double seg) {
++    const int32_t i = (int32_t) deep_nodes.size();
++    deep_nodes.push_back(t);
++
++    json shape = json::array();
++    int nd = GGML_MAX_DIMS;
++    while (nd > 1 && t->ne[nd - 1] == 1) {
++        nd--;
++    }
++    for (int d = 0; d < nd; ++d) {
++        shape.push_back(t->ne[d]);
++    }
++
++    // sources that are nodes of this layer; a view source is resolved to the tensor it views
++    json src = json::array();
++    std::vector<int32_t> seen;
++    for (int k = 0; k < GGML_MAX_SRC; ++k) {
++        const ggml_tensor * s = t->src[k];
++        if (!s) {
++            continue;
++        }
++        if (s->view_src) {
++            s = s->view_src;
++        }
++        for (int32_t j = 0; j < i; ++j) {
++            if (deep_nodes[j] == s) {
++                if (std::find(seen.begin(), seen.end(), j) == seen.end()) {
++                    seen.push_back(j);
++                    src.push_back(j);
++                }
++                break;
++            }
++        }
++    }
++
++    json ev = trace_ev("decode.node");
+     ev["step"]  = step;
+-    ev["layer"] = il;
+-    ev["top"]   = top(w_avg);
++    ev["layer"] = deep_cur_layer;
++    ev["i"]     = i;
++    // unnamed nodes have no name, or the "node_<n>" ggml_graph_print-style name the graph gave them
++    const bool unnamed = !base || !base[0] || (strncmp(base, "node_", 5) == 0 && strspn(base + 5, "0123456789") == strlen(base + 5));
++    ev["name"]  = unnamed ? trace_lower(ggml_op_desc(t)) : std::string(base);
++    ev["op"]    = ggml_op_desc(t);
++    ev["shape"] = std::move(shape);
++    ev["ms"]    = seg;
++    if (!src.empty()) {
++        ev["src"] = std::move(src);
++    }
++    json stats;
++    if (trace_stats(t, stats)) {
++        ev["stats"] = std::move(stats);
++    }
+     emit(std::move(ev));
+-    for (size_t h = 0; h < w_heads.size(); ++h) {
+-        json he = trace_ev("decode.attn");
+-        he["step"]  = step;
+-        he["layer"] = il;
+-        he["head"]  = (int) h;
+-        he["top"]   = top(w_heads[h]);
+-        emit(std::move(he));
++    deep_cur = nullptr;
++}
++
++// token piece as valid UTF-8 (byte-level BPE pieces can be partial characters): invalid bytes -> U+FFFD
++static std::string trace_utf8(const std::string & s) {
++    std::string r;
++    size_t i = 0;
++    while (i < s.size()) {
++        const unsigned char c = (unsigned char) s[i];
++        const size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
++        bool ok = len > 0 && i + len <= s.size();
++        for (size_t k = 1; ok && k < len; ++k) {
++            ok = ((unsigned char) s[i + k] >> 6) == 0x2;
++        }
++        if (ok) {
++            r.append(s, i, len);
++            i += len;
++        } else {
++            r += "\xEF\xBF\xBD";
++            i += 1;
++        }
++    }
++    return r;
++}
++
++// logit lens of layers [il_first, il_first + n): one graph through output_norm + output on the head's
++// backend, then softmax / entropy / top-k per row on the CPU (rows in parallel)
++void server_trace::lens_run(int il_first, int n) {
++    if (lens_failed || n <= 0 || n_vocab <= 0) {
++        return;
++    }
++    lens_logits.resize((size_t) n*n_vocab);
++    if (llama_trace_logit_lens(ctx, lens_rows.data() + (size_t) il_first*n_embd, n, lens_logits.data()) != 0) {
++        lens_failed = true;
++        SRV_WRN("%s", "trace: logit lens failed, no decode.lens for the rest of this request\n");
++        return;
++    }
++    struct res_t {
++        std::vector<std::pair<float, int32_t>> top; // p, id
++        double entropy = 0.0;
++    };
++    std::vector<res_t> res(n);
++    const int K = p.lens_topk;
++    auto work = [&](int r) {
++        if (!lens_have[il_first + r]) {
++            return;
++        }
++        const float * x = lens_logits.data() + (size_t) r*n_vocab;
++        float mx = -INFINITY;
++        for (int32_t j = 0; j < n_vocab; ++j) {
++            mx = std::max(mx, x[j]);
++        }
++        double z = 0.0, ex = 0.0;
++        using item = std::pair<float, int32_t>;
++        std::priority_queue<item, std::vector<item>, std::greater<item>> heap;
++        float thr = -INFINITY;
++        for (int32_t j = 0; j < n_vocab; ++j) {
++            const double e = std::exp((double) x[j] - mx);
++            z  += e;
++            ex += e*x[j];
++            if ((int) heap.size() < K) {
++                heap.push({ x[j], j });
++                thr = heap.top().first;
++            } else if (x[j] > thr) {
++                heap.pop();
++                heap.push({ x[j], j });
++                thr = heap.top().first;
++            }
++        }
++        const double log_z = mx + std::log(z);
++        res[r].entropy = log_z - ex/z; // H = log Z - E_p[x]
++        while (!heap.empty()) {
++            res[r].top.push_back({ (float) std::exp((double) heap.top().first - log_z), heap.top().second });
++            heap.pop();
++        }
++        std::reverse(res[r].top.begin(), res[r].top.end());
++    };
++    const int n_thr = std::max(1, std::min<int>({ n, 8, (int) std::thread::hardware_concurrency() }));
++    std::vector<std::thread> pool;
++    for (int ti = 0; ti < n_thr; ++ti) {
++        pool.emplace_back([&, ti]() {
++            for (int r = ti; r < n; r += n_thr) {
++                work(r);
++            }
++        });
++    }
++    for (auto & th : pool) {
++        th.join();
++    }
++    for (int r = 0; r < n; ++r) {
++        if (!lens_have[il_first + r]) {
++            continue;
++        }
++        json top = json::array();
++        for (const auto & [pr, id] : res[r].top) {
++            top.push_back({{"id", id}, {"p", pr}, {"text", trace_utf8(common_token_to_piece(ctx, id, true))}});
++        }
++        json ev = trace_ev("decode.lens");
++        ev["step"]    = step;
++        ev["layer"]   = il_first + r;
++        ev["top"]     = std::move(top);
++        ev["entropy"] = (float) std::max(0.0, res[r].entropy);
++        emit(std::move(ev));
+     }
+ }
+ 
+diff --git a/tools/server/server-trace.h b/tools/server/server-trace.h
+index 0a3024bef..8dad42408 100644
+--- a/tools/server/server-trace.h
++++ b/tools/server/server-trace.h
+@@ -43,6 +43,12 @@ struct server_trace_params {
+     server_trace_step step  = SERVER_TRACE_STEP_NONE;
+     int32_t step_timeout_ms = 60000;
+ 
++    // deep tier (requires detail full): decode.node for every non-view node of each decode layer,
++    // decode.lens (logit lens) and decode.attn.heads (per-head rows) on every layer
++    bool    deep            = false;
++    int32_t lens_topk       = 5;     // tokens per decode.lens
++    int32_t attn_window     = 512;   // last KV positions per decode.attn.heads row
++
+     bool enabled() const { return detail != SERVER_TRACE_OFF; }
+ 
+     // throws std::invalid_argument on a malformed object; null -> disabled
+@@ -97,12 +103,18 @@ private:
+ 
+     std::function<void()> flush_fn; // sends a trace-only chunk (stream + step mode)
+     std::function<bool()> alive_fn; // client still connected
++    llama_context * ctx = nullptr;
+     int32_t id_slot  = -1;
+     int32_t n_layer  = 0;
+     bool    step_own = false; // holds the global step gate
+     bool    step_busy = false; // step mode requested, but another request holds the gate
+     bool    no_stages = false; // backend sampling: no CPU chain to observe
+     attn_kind attn = ATTN_NONE;
++    int32_t n_head_kv  = 0;
++    int32_t n_embd     = 0;
++    int32_t n_vocab    = 0;
++    bool    lens_ok    = false; // deep: the model has an output head the lens can use
++    bool    saw_layers = false; // deep: the graph has nodes named <name>-<il>
+ 
+     // current pass
+     bool    prefill  = false;
+@@ -130,16 +142,31 @@ private:
+     std::vector<int32_t> moe_ids;
+     std::vector<float>   moe_w;
+ 
++    // deep detail, current pass
++    int32_t deep_layer = -1;                    // layer the next node belongs to (-1: outside the layers)
++    int32_t deep_list_layer = -1;               // layer of deep_nodes
++    std::vector<const ggml_tensor *> deep_nodes; // observed nodes of that layer, by index i
++    const ggml_tensor * deep_cur = nullptr;     // node answered true in the ask phase, observed next
++    int32_t deep_cur_layer = -1;
++    double  op_pending = 0.0;                   // ms of observed nodes not yet charged to a decode.op
++    std::vector<float>   lens_rows;             // l_out of the current token, n_layer x n_embd
++    std::vector<uint8_t> lens_have;
++    std::vector<float>   lens_logits;
++    bool    lens_failed = false;
++
+     // sampling
+     int32_t sample_step = 0;
+     double  draw = -1.0;
+ 
+     void emit(json && ev);
+     bool want(const struct ggml_tensor * t, const char * base, int il) const;
+-    void on_observed(struct ggml_tensor * t, const char * base, int il);
++    void on_observed(struct ggml_tensor * t, const char * base, int il, int64_t now);
++    bool deep_ask   (const struct ggml_tensor * t, bool named, int il);
++    void deep_node  (const struct ggml_tensor * t, const char * base, double seg);
++    void lens_run   (int il_first, int n);
+     void attn_softmax(struct ggml_tensor * t, int il);
+     void attn_flash  (struct ggml_tensor * t, int il);
+-    void attn_emit(int il, const std::vector<float> & w_avg, const std::vector<std::vector<float>> & w_heads);
++    void attn_emit(int il, const std::vector<float> & w_avg, const std::vector<std::vector<float>> & w_heads, int64_t n_kv_head);
+     void wait_step(const char * granularity);
+ };
+ 
+-- 
+2.47.1.windows.2
+

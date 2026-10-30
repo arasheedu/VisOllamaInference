@@ -1,7 +1,7 @@
 From 5cdcbf45da8d37b9ab9fe41dcd44c87d70d65ccc Mon Sep 17 00:00:00 2001
 From: Rasheed <arasheedu@gmail.com>
 Date: Thu, 29 Oct 2026 16:00:08 -0700
-Subject: [PATCH 6/6] server: cheaper full-detail tracing, layer device from
+Subject: [PATCH 6/7] server: cheaper full-detail tracing, layer device from
  its weights
 
 [visualizer-trace] skip observing no-op view nodes (fewer GPU syncs), read

@@ -1,7 +1,7 @@
 From 844194d6c347706f3375c35959696a75dd7a390a Mon Sep 17 00:00:00 2001
 From: Rasheed <arasheedu@gmail.com>
 Date: Thu, 29 Oct 2026 15:47:53 -0700
-Subject: [PATCH 5/6] server: capture sampler stages in sample step mode at any
+Subject: [PATCH 5/7] server: capture sampler stages in sample step mode at any
  detail
 
 [visualizer-trace] step: "sample" pauses between decode.sample.stage

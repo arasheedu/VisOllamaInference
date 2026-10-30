@@ -1,7 +1,7 @@
 From 3ca62108b747bd3128386484a063f51e44ab3aab Mon Sep 17 00:00:00 2001
 From: Rasheed <arasheedu@gmail.com>
 Date: Thu, 29 Oct 2026 15:21:55 -0700
-Subject: [PATCH 2/6] common: optional per-stage observer for
+Subject: [PATCH 2/7] common: optional per-stage observer for
  common_sampler_sample
 
 [visualizer-trace] common_sampler_set_stage_cb() applies the chain one

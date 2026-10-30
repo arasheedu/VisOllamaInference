@@ -1,7 +1,7 @@
 From 87094036ac668f43ebcd6f780aa3c907975f31c1 Mon Sep 17 00:00:00 2001
 From: Rasheed <arasheedu@gmail.com>
 Date: Thu, 29 Oct 2026 15:08:43 -0700
-Subject: [PATCH 1/6] llama: add llama_set_eval_callback to install the eval
+Subject: [PATCH 1/7] llama: add llama_set_eval_callback to install the eval
  callback at runtime
 
 [visualizer-trace] lets llama-server enable the scheduler eval callback only

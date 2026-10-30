@@ -6,10 +6,10 @@ model in a `llama-server` subprocess, forwards the events and adds `v`, `req` an
 
 - Base: llama.cpp tag **b11963** (`39febd2ad`), the tag in `ollama/LLAMA_CPP_VERSION`.
 - Source: `C:\BitsPlus\VisOllamInference\llama.cpp`, branch `visualizer-trace`.
-- Patch series: `000{1..6}-*.patch` in this directory (`git format-patch b11963..visualizer-trace`,
+- Patch series: `000{1..7}-*.patch` in this directory (`git format-patch b11963..visualizer-trace`,
   for `git am`).
 - For Ollama's build: `ollama-compat/100-visualizer-trace.patch`, the same change squashed into one
-  patch (see §7 for why). 15 files, +1358/−3.
+  patch (see §7 for why). 15 files, +1850/−3.
 
 | Patch | What it does |
 |---|---|
@@ -19,6 +19,7 @@ model in a `llama-server` subprocess, forwards the events and adds `v`, `req` an
 | 0004 `server:` | Step mode ends when the client disconnects; sample pauses report the real step |
 | 0005 `server:` | `step: "sample"` captures sampler stages at any detail level |
 | 0006 `server:` | Fewer GPU syncs (skip view nodes), single-transfer reads, layer device taken from its weights |
+| 0007 `server:` | Deep tier (`deep: true`): `decode.node` for every graph node, `decode.lens` (logit lens through the real head, `llama_trace_logit_lens()`), `decode.attn.heads`; cheaper FA attention rebuild (§10) |
 
 Without a `trace` field in the request, nothing changes. No eval callback is installed, each hook
 costs one branch, and the sampler chain runs as one `llama_sampler_apply`. The output is
@@ -41,12 +42,15 @@ through to the completion params.
   "attn_heads": false,           // also one decode.attn per head (with "head")
   "sample_topn": 64,             // candidates per decode.sample.stage (1..1024)
   "step": null | "layer" | "sample",   // "token" is accepted and ignored (Go handles it)
-  "step_timeout_ms": 60000       // per pause
+  "step_timeout_ms": 60000,      // per pause
+  "deep": false,                 // deep tier, requires detail "full" (§10)
+  "lens_topk": 5,                // tokens per decode.lens (1..100)
+  "attn_window": 512             // last KV cells per decode.attn.heads row
 }
 ```
 
 All fields except `detail` are optional, and the values above are the defaults. A bad `detail` or
-`step` value returns HTTP 400 with `Field 'trace': ...`.
+`step` value, or `deep` without `detail: "full"`, returns HTTP 400 with `Field 'trace': ...`.
 
 What each level emits:
 
@@ -56,6 +60,7 @@ What each level emits:
 | `decode.layer` (without `norm` at `layers`) | ✓ | ✓ (with `norm`) |
 | `prefill.layer`, `decode.op`, `decode.residual`, `decode.kv.write`, `decode.attn`, `decode.moe` | | ✓ |
 | `decode.sample.stage` | | ✓ (every step) |
+| `decode.node`, `decode.lens`, `decode.attn.heads` | | with `deep: true` only (§10) |
 | `step.timeout` | step mode | step mode |
 
 Downsampling applies to everything that comes from the forward pass (`decode.layer/op/residual/kv.write/attn/moe`).
@@ -256,6 +261,8 @@ Responses:
 | `no_attn` | `detail: full`, but the model graph has neither a `kq_soft_max` nor a flash-attention node (e.g. recurrent / SSM models) |
 | `no_sample_stages` | backend (GPU) sampling is active (`--backend-sampling`), so there is no CPU chain to observe |
 | `no_step` | step mode was requested, but another request holds the step gate |
+| `no_lens` | `deep`, but the model has no output head the logit lens can reach (no `output` / `output_norm` tensor) |
+| `no_nodes` | `deep`, but the graph has no nodes named `<name>-<il>`, so layer membership is unknown |
 
 **Flash attention is supported.** It can't be switched per request: the KV-cache layout is fixed at
 context creation and a quantised V cache requires FA. So the collector handles both graphs. Without
@@ -444,3 +451,138 @@ attention rebuild. Before commit 0006 (one sync more per Q/K/V view, one transfe
 - Final build: 28,690 events (30 tokens, stride 1, attention on every layer, per head), 0 schema errors.
 - Built through Ollama's `llama/server` CMake project (see §7).
 - MoE (`decode.moe`) is **not** verified, because no MoE model is available locally.
+
+## 10. Deep tier (`deep: true`)
+
+Contract: `docs/deep-tier.md`. `"deep": true` (requires `"detail": "full"`) keeps every `full`
+event and adds three events on **every layer** of each traced decode step. The step selection is
+unchanged (steps < 8, then every `layer_stride`-th; step mode forces stride 1). Prefill passes are
+not deep.
+
+| Event | What |
+|---|---|
+| `decode.node` | every non-view node of the layer, in execution order |
+| `decode.lens` | logit lens: `l_out` of the current token through the real `output_norm` + `output` |
+| `decode.attn.heads` | softmaxed attention row of every query head over the last `attn_window` KV cells |
+
+### How
+
+- **Nodes.** In the ask phase every decode node is assigned to a layer: a node named `<name>-<il>` to
+  layer `il`, any other node to the layer that is open (after `l_out-<L>` that is `L+1`; nodes
+  before layer 0's first node and after the last `l_out`, i.e. `inp_embd`, `result_norm`,
+  `result_output`, are outside). Every non-view node of a layer is observed (one sync each), so
+  `ms` is that node's own segment (plus any views just before it). `RESHAPE`/`VIEW`/`PERMUTE`/
+  `TRANSPOSE`/`NONE` are never observed. `src` resolves a view source to its `view_src` (the
+  tensor it views) and keeps only nodes already seen in this layer. `stats` read the whole result
+  (decode = one token), F32/F16/BF16 only, ≤ 2^20 elements, contiguous, and not for results that
+  alias another buffer (`SET_ROWS` into the K/V cache). Non-finite values are skipped in the stats.
+- **Op attribution at deep.** Because every node is observed, segments that end at a node without an
+  op mapping (`norm`, `kq`, `get_rows`, …) are carried to the next node that has one, so
+  `decode.op` sums match `full`.
+- **Lens.** `l_out` of each layer is copied while reading it for `decode.residual`. After the pass
+  (`after_decode`), `llama_trace_logit_lens(ctx, rows, n_layer, logits)` (new API in `llama.h`,
+  `llama_context::trace_logit_lens`) runs one small graph for all 28 rows at once:
+  `rms_norm` (or `norm` + bias if the model has `output_norm_b`) · `output_norm` → `mul_mat(output)`
+  (· `output_s`, + `output_b`). It runs on the context's backend that supports the `output`
+  weight's buffer (CUDA0 with `-ngl 99`, CPU otherwise), outside the scheduler, with its own
+  `ggml_gallocr`. The graph is built once and reused (CUDA graphs are keyed by the first node).
+  The logits come back to the host and softmax / entropy (`log Z − E_p[x]`, nats) / top-k run on
+  the CPU, rows in parallel. In layer step mode the lens of each layer runs (one row) right before
+  that layer's pause, so the app sees it while paused. LoRA adapters, Hadamard-folded heads and
+  arch-specific logit scaling (Cohere `f_logit_scale`, Gemma final softcap) are not applied, so
+  the lens is exact for llama-family models only. `text` is `common_token_to_piece(…, special)`,
+  with invalid UTF-8 bytes (partial byte-level pieces) replaced by U+FFFD.
+- **Heads.** Both attention paths (`kq_soft_max` and the FA rebuild) now produce per-head rows on
+  every layer at deep. `decode.attn` (averaged) stays on every `attn_layers`-th layer as before.
+  The KV view is padded (n_kv = 256 for a short prompt), so `n_kv` in the contract is taken as
+  *last cell with a non-zero weight in any head + 1*; `from = max(0, n_kv − attn_window)`. Weights
+  are rounded to 4 decimals. `n_kv_head` = `k->ne[2]` (FA) or `llama_model_n_head_kv` (non-FA).
+- **Cheaper FA rebuild** (also helps `full`): only the K cells up to the last unmasked one are
+  transferred, masked cells are skipped, and K is converted to f32 once per KV head instead of once
+  per query head.
+
+### Samples (llama3.2 3B Q4_K_M, CUDA, `-ngl 99`, FA on; prompt "Write a short poem about the ocean.")
+
+Layer 14 of step 5, all 19 nodes (`stats` shortened):
+
+```jsonc
+{"type":"decode.node","step":5,"layer":14,"i":0,"name":"norm","op":"RMS_NORM","shape":[3072],"ms":0.0168,"stats":{"min":-8.078,"max":22.188,"mean":0.0157,"rms":0.99987}}
+{"type":"decode.node","step":5,"layer":14,"i":1,"name":"attn_norm","op":"MUL","shape":[3072],"ms":0.0132,"src":[0],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":2,"name":"Qcur","op":"MUL_MAT","shape":[3072],"ms":0.0358,"src":[1],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":3,"name":"Qcur","op":"ROPE","shape":[128,24],"ms":0.0132,"src":[2],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":4,"name":"Vcur","op":"MUL_MAT","shape":[1024],"ms":0.0214,"src":[1],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":5,"name":"Kcur","op":"MUL_MAT","shape":[1024],"ms":0.0205,"src":[1],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":6,"name":"Kcur","op":"ROPE","shape":[128,8],"ms":0.0127,"src":[5],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":7,"name":"set_rows","op":"SET_ROWS","shape":[1024,4096],"ms":0.0139,"src":[6]}   // K -> cache (no stats: aliases the cache)
+{"type":"decode.node","step":5,"layer":14,"i":8,"name":"set_rows","op":"SET_ROWS","shape":[1024,4096],"ms":0.0128,"src":[4]}   // V -> cache
+{"type":"decode.node","step":5,"layer":14,"i":9,"name":"flash_attn_ext","op":"FLASH_ATTN_EXT","shape":[128,24],"ms":0.0198,"src":[3],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":10,"name":"attn_out","op":"MUL_MAT","shape":[3072],"ms":0.0419,"src":[9],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":11,"name":"ffn_inp","op":"ADD","shape":[3072],"ms":0.0139,"src":[10],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":12,"name":"norm","op":"RMS_NORM","shape":[3072],"ms":0.0131,"src":[11],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":13,"name":"ffn_norm","op":"MUL","shape":[3072],"ms":0.0133,"src":[12],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":14,"name":"ffn_gate","op":"MUL_MAT","shape":[8192],"ms":0.072,"src":[13],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":15,"name":"ffn_up","op":"MUL_MAT","shape":[8192],"ms":0.0702,"src":[13],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":16,"name":"ffn_swiglu","op":"SWIGLU","shape":[8192],"ms":0.0156,"src":[14,15],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":17,"name":"ffn_out","op":"MUL_MAT","shape":[3072],"ms":0.072,"src":[16],"stats":{...}}
+{"type":"decode.node","step":5,"layer":14,"i":18,"name":"l_out","op":"ADD","shape":[3072],"ms":0.0143,"src":[17,11],"stats":{...}}
+```
+
+- The FA node is unnamed (the graph calls it `node_<n>`), so its name is the lowercased op.
+  `op` is `ggml_op_desc()`, which gives the GLU / unary sub-op (`SWIGLU`, not `GLU`).
+- Without FA (`-fa off`), nodes 9–12 are `kq` `MUL_MAT [256,1,24]`, `kq_soft_max` `SOFT_MAX
+  [256,1,24]`, `kqv` `MUL_MAT [128,1,24]`, `kqv_out` `CONT [3072]` (22 nodes per layer), and the V
+  store is `SET_ROWS [1,4194304]` (transposed V cache).
+- The last layer has two extra unnamed `get_rows` nodes after `attn_out` (the `inp_out_ids`
+  selection): 21 nodes.
+- The layer's input (previous `l_out`) is outside the layer, so `ffn_inp`'s and `norm`'s sources
+  list only in-layer nodes.
+
+```jsonc
+// middle layer: no prediction yet
+{"type":"decode.lens","step":5,"layer":14,"top":[{"id":6458,"p":0.0365,"text":"/w"},{"id":47527,"p":0.0286,"text":"/is"},{"id":22552,"p":0.0050,"text":" hereby"},{"id":85962,"p":0.0020,"text":" Sass"},{"id":50801,"p":0.0018,"text":" presently"}],"entropy":10.277}
+// last layer = the model's distribution; the greedy sampler picked 264 (" a")
+{"type":"decode.lens","step":5,"layer":27,"top":[{"id":264,"p":0.6631,"text":" a"},{"id":13057,"p":0.1223,"text":" vast"},{"id":779,"p":0.0295,"text":" so"},{"id":856,"p":0.0198,"text":" my"},{"id":5655,"p":0.0191,"text":" deep"}],"entropy":1.660}
+// 24 rows (query heads), each over KV cells 0..12 (the token is at position 12)
+{"type":"decode.attn.heads","step":5,"layer":14,"from":0,"n_kv_head":8,"rows":[[0.1338,0.0012,0.0001,0.0001,0.0007,0.0004,0.001,0.0084,0.0057,0.0389,0.2468,0.5463,0.0168],[0.993,0.0009,...],...]}
+```
+
+Layer 0's lens predicts the *input* token with p ≈ 1 (llama3.2 ties `output` to `token_embd`,
+and layer 0's residual is still mostly the input embedding). That is the model, not a bug.
+
+### Cost
+
+Same setup as §8 (prompt ~17 tokens, `n_predict: 128`, `ignore_eos`, temperature 0, 3 runs after a
+warm-up). Text md5 identical in every column of each row.
+
+| Build | no trace | `full` | `full`, stride 1 | `deep` (stride 4) | `deep`, stride 1 |
+|---|---|---|---|---|---|
+| CUDA, `-ngl 99` | 108.6 | 77.7 | 51.5 | 40.2 | **13.2** (13.39 / 13.05 / 13.21) |
+| CPU, 10 threads | 30.4 | – | 23.9 | – | **9.1** (9.24 / 9.08 / 9.11) |
+
+`full` got faster with this commit (71.1 → 77.7, stride 1 41.9 → 51.5 on CUDA) because of the
+cheaper FA rebuild.
+
+Per traced deep token on CUDA (positions 0–150): ~66 ms more than untraced (75.6 vs 9.2 ms).
+Of that, the forward pass with every node observed takes ~25 ms of compute (vs ~9 ms), the logit
+lens ~9–12 ms (one 28-row matmul on the GPU, 14 MB of logits back to the host, and softmax / top-k
+over 28 × 128,256 on 8 threads), and the rest is per-node readbacks for `stats` (~10 ms, ~530
+small transfers), the per-layer FA rebuild for 24 heads (~15 ms) and JSON (~0.3–0.5 MB per token).
+On CPU the lens is ~47 ms per token (the 28-row output matmul on the CPU). Text at temperature 0 is
+byte-identical to untraced on both builds; the lens graph runs outside the scheduler, after the
+logits were copied out.
+
+### Verification (deep)
+
+- 186,412 llama-server events (deep, stride 1, FA and non-FA, CUDA) + 35,251 events recorded
+  through Ollama at `X-Trace-Detail: deep` pass `validateEventObject` with 0 errors.
+- Text md5 identical: no trace / `full` / `deep` / `deep, stride 1` on CUDA and CPU (llama-server),
+  and `basic` / `full` / `deep` through Ollama.
+- Last layer's lens = raw logits: top-5 ids equal `decode.sample.stage raw`'s top-5 on 127 / 127
+  steps, logit gap of the top two within 0.0011.
+- FA vs non-FA `decode.attn.heads` (`-fa on` vs `-fa off`, steps 2–25 where both runs produce the
+  same tokens): max weight difference 0.022.
+- Layer step mode at deep: 56 pauses (2 steps × 28 layers), every trace-only chunk at a pause
+  carries that layer's `decode.node` events and its `decode.lens`; no timeouts.
+- Series check: `git am 0001..0007` on b11963 gives the `visualizer-trace` tree; the squashed
+  patch applies through `apply-git-patches.cmake` and the Ollama-built payload
+  (`C:\ollama-trace-deep\lib\ollama`) emits the deep events.

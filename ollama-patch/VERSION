@@ -4,5 +4,5 @@ base_commit=8861adaa77839c961d3c574232a8865d65a426b6
 branch=visualizer-trace
 llama_cpp=b11963
 go=1.26.10
-head=cc93555e
-patches=0001..0010 (git format-patch 8861adaa..visualizer-trace)
+head=1dbdd551
+patches=0001..0012 (git format-patch 8861adaa..visualizer-trace)

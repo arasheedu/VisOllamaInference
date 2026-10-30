@@ -140,7 +140,7 @@ Models come from `%USERPROFILE%\.ollama\models` (`OLLAMA_MODELS` overrides it).
 | Variable | Default | Meaning |
 |---|---|---|
 | `OLLAMA_TRACE_URL` | unset (tracing off) | Hub WebSocket, e.g. `ws://127.0.0.1:4711/ingest`. Unset: every trace call is a nil no-op, and llama-server requests are unchanged. |
-| `OLLAMA_TRACE_DETAIL` | `basic` | Default when a request has no `X-Trace-Detail`. `layers`/`full` ask llama-server for its own events. |
+| `OLLAMA_TRACE_DETAIL` | `basic` | Default when a request has no `X-Trace-Detail`. `layers`/`full` ask llama-server for its own events. `deep` adds `decode.node`, `decode.lens`, `decode.attn.heads` (llama-server `deep: true`). |
 | `OLLAMA_TRACE_STEP` | unset | Step mode for every request (`token`, `layer`, `sample`). Normally the header is used. |
 | `OLLAMA_TRACE_STEP_TIMEOUT` | `60s` | Wait per pause (token gate in Go; passed to llama-server as `step_timeout_ms`). |
 | `OLLAMA_TRACE_LAYER_STRIDE` | `4` | llama-server `layer_stride`. Forward-pass events on steps < 8, then every Nth step. `1` = every step. Layer step mode forces 1. |
@@ -152,7 +152,7 @@ Models come from `%USERPROFILE%\.ollama\models` (`OLLAMA_MODELS` overrides it).
 | Header | Meaning |
 |---|---|
 | `X-Trace-Request-Id` | Correlation id, echoed as `req`. If missing, Ollama generates one and returns it (CORS-exposed). |
-| `X-Trace-Detail` | `basic` \| `layers` \| `full` |
+| `X-Trace-Detail` | `basic` | `layers` | `full` | `deep` |
 | `X-Trace-Step` | `token` (Go gate, llama-server keeps generating), `layer` or `sample` (llama-server pauses; acks are forwarded to `POST /trace/ack`). |
 
 ## Tests
@@ -169,3 +169,30 @@ and final-array chunks, and ack/continue forwarding.
 ## Benchmarks
 
 See NOTES.md § Performance.
+
+## Deep-tier install (`C:\ollama-trace-deep`)
+
+Same layout as `C:\ollama-trace-full`, built from `visualizer-trace` head `1dbdd551` (patches
+0001–0012) and the native payload with patch 0007 of the llama.cpp series:
+
+```bat
+rem llama.cpp source with the compat patches applied (the root build passes
+rem OLLAMA_LLAMA_CPP_SKIP_COMPAT_PATCH=ON for a source override, so prepare it first)
+git -C llama.cpp worktree add --detach C:\BitsPlus\vis-build\llama-src-deep b11963
+cd /d C:\BitsPlus\vis-build\llama-src-deep
+cmake -DPATCH_DIR=C:/BitsPlus/VisOllamInference/ollama/llama/compat -DPATCH_LABEL=llama/compat -P C:/BitsPlus/VisOllamInference/ollama/cmake/apply-git-patches.cmake
+rem then, with the env of section 3:
+cmake -S ollama -B C:\BitsPlus\vis-build\build-ollama-deep -G "Visual Studio 17 2022" -A x64 -DOLLAMA_LLAMA_BACKENDS=cuda_v12 ^
+  -DCMAKE_CUDA_ARCHITECTURES=89 -DOLLAMA_BUILD_PARALLEL=16 -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=C:/BitsPlus/vis-build/llama-src-deep
+cmake --build C:\BitsPlus\vis-build\build-ollama-deep --config Release --target ollama-llama-server-local ollama-llama-server-cuda_v12 -- /m:2
+```
+
+```bash
+go build -ldflags="-linkmode=internal -X github.com/ollama/ollama/version.Version=0.40.13-trace-deep" -o C:/ollama-trace-deep/ollama.exe .
+cp -r /c/BitsPlus/vis-build/build-ollama-deep/lib C:/ollama-trace-deep/
+```
+
+Run it like the full install, e.g. `OLLAMA_HOST=127.0.0.1:11438`, `OLLAMA_TRACE_URL=ws://127.0.0.1:4711/ingest`,
+and send `X-Trace-Detail: deep` (or set `OLLAMA_TRACE_DETAIL=deep`). Use it with step mode
+(`X-Trace-Step: layer`) or `OLLAMA_TRACE_LAYER_STRIDE` ≥ 4; deep at stride 1 decodes at ~13 tok/s on
+the RTX 4060.

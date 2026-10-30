@@ -1,0 +1,226 @@
+From 0b93d873ee0428b7b2d9f09be23ecf0712b7be9f Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 23:32:54 -0700
+Subject: [PATCH 11/12] trace: deep detail level for llama-server graph nodes
+ and logit lens
+
+Deep (> Full) forwards decode.node, decode.lens and decode.attn.heads and
+asks llama-server for detail "full" with deep: true. X-Trace-Detail: deep
+and OLLAMA_TRACE_DETAIL=deep select it; everything allowed at Full is
+allowed at Deep, and the new events get the same 0-based step as the rest.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ envconfig/config.go                   |  2 +-
+ llm/llama_server_runner_trace.go      |  7 +++-
+ llm/llama_server_runner_trace_test.go | 51 +++++++++++++++++++++++++++
+ trace/runner.go                       |  3 ++
+ trace/runner_test.go                  | 28 ++++++++-------
+ trace/tracer.go                       |  9 ++++-
+ 6 files changed, 85 insertions(+), 15 deletions(-)
+
+diff --git a/envconfig/config.go b/envconfig/config.go
+index d407255d..1c914545 100644
+--- a/envconfig/config.go
++++ b/envconfig/config.go
+@@ -377,7 +377,7 @@ func AsMap() map[string]EnvVar {
+ 		"OLLAMA_EDITOR":               {"OLLAMA_EDITOR", Editor(), "Path to editor for interactive prompt editing (Ctrl+G)"},
+ 		"OLLAMA_REMOTES":              {"OLLAMA_REMOTES", Remotes(), "Allowed hosts for remote models (default \"ollama.com\")"},
+ 		"OLLAMA_TRACE_URL":            {"OLLAMA_TRACE_URL", TraceURL(), "WebSocket URL of an inference visualizer trace hub (e.g. ws://127.0.0.1:4711/ingest)"},
+-		"OLLAMA_TRACE_DETAIL":         {"OLLAMA_TRACE_DETAIL", TraceDetail(), "Default trace detail level: basic, layers or full (default basic)"},
++		"OLLAMA_TRACE_DETAIL":         {"OLLAMA_TRACE_DETAIL", TraceDetail(), "Default trace detail level: basic, layers, full or deep (default basic)"},
+ 		"OLLAMA_TRACE_STEP":           {"OLLAMA_TRACE_STEP", TraceStep(), "Trace step mode for every request (token)"},
+ 		"OLLAMA_TRACE_STEP_TIMEOUT":   {"OLLAMA_TRACE_STEP_TIMEOUT", TraceStepTimeout(), "How long a step-mode request waits for an ack (default \"60s\")"},
+ 		"OLLAMA_TRACE_LAYER_STRIDE":   {"OLLAMA_TRACE_LAYER_STRIDE", TraceLayerStride(), "Trace layer events on every Nth decode step after the first 8 (default 4)"},
+diff --git a/llm/llama_server_runner_trace.go b/llm/llama_server_runner_trace.go
+index e3a92b01..50338b3f 100644
+--- a/llm/llama_server_runner_trace.go
++++ b/llm/llama_server_runner_trace.go
+@@ -17,6 +17,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/ollama/ollama/envconfig"
++	"github.com/ollama/ollama/trace"
+ )
+ 
+ // A llama-server built with the visualizer trace patch (llama/compat/
+@@ -34,6 +35,7 @@ type runnerTraceRequest struct {
+ 	AttnHeads     bool   `json:"attn_heads"`
+ 	Step          string `json:"step,omitempty"`
+ 	StepTimeoutMS int64  `json:"step_timeout_ms,omitempty"`
++	Deep          bool   `json:"deep,omitempty"`
+ }
+ 
+ // runnerTraceChunk holds the trace fields of one streamed llama-server chunk.
+@@ -209,9 +211,12 @@ func (d *traceDecode) runnerTrace(ctx context.Context, s *llamaServerRunner) *ru
+ 		AttnLayers:  max(envconfig.TraceAttnLayers(), 1),
+ 		AttnHeads:   envconfig.TraceAttnHeads(),
+ 	}
+-	if d.tr.Detail().String() == "full" {
++	if d.tr.Detail() >= trace.Full {
+ 		r.Detail = "full"
+ 	}
++	if d.tr.Detail() >= trace.Deep {
++		r.Deep = true // llama-server: deep requires detail "full"
++	}
+ 	if step := d.tr.RunnerStep(); step != "" {
+ 		if d.tr.HubConnected() {
+ 			r.Step = step
+diff --git a/llm/llama_server_runner_trace_test.go b/llm/llama_server_runner_trace_test.go
+index 538c79f2..b51c0dee 100644
+--- a/llm/llama_server_runner_trace_test.go
++++ b/llm/llama_server_runner_trace_test.go
+@@ -439,6 +439,57 @@ func TestRunnerTraceLayersFiltersFullTier(t *testing.T) {
+ 	}
+ }
+ 
++// At deep detail the runner gets detail "full" with deep: true, and the deep
++// events are forwarded with Ollama's step numbering; at full they are dropped.
++func TestRunnerTraceDeep(t *testing.T) {
++	traceTestHub(t)
++	stream := func(w io.Writer, flush func(), _ <-chan map[string]any) {
++		sse(w, flush,
++			`{"content":"A","stop":false,"timings":{"predicted_n":1},"__trace_t_ns":100,"__trace_caps":[],"__trace_slot":0,"__trace":[{"type":"prefill.done","t_ns":10,"n_tokens":1,"ms":1},{"type":"decode.sample","t_ns":20,"step":1,"chosen_id":1,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}]}`,
++			`{"content":"B","stop":false,"timings":{"predicted_n":2},"__trace_t_ns":200,"__trace":[`+
++				`{"type":"decode.node","t_ns":140,"step":2,"layer":0,"i":0,"name":"norm","op":"RMS_NORM","shape":[3072],"ms":0.01,"stats":{"min":-1,"max":1,"mean":0,"rms":0.5}},`+
++				`{"type":"decode.attn.heads","t_ns":145,"step":2,"layer":0,"from":0,"n_kv_head":1,"rows":[[0.9,0.1]]},`+
++				`{"type":"decode.layer","t_ns":150,"step":2,"layer":0,"ms":0.5},`+
++				`{"type":"decode.lens","t_ns":155,"step":2,"layer":0,"top":[{"id":2,"p":0.5,"text":"B"}],"entropy":1.2},`+
++				`{"type":"decode.sample","t_ns":160,"step":2,"chosen_id":2,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}]}`,
++			`{"content":"","stop":true,"stop_type":"limit","timings":{"predicted_n":2}}`,
++		)
++	}
++
++	f, r := newFakeLlamaServer(t, true, stream)
++	evs := tracedCompletion(t, r, "rt-deep", "deep", "")
++	checkEnvelope(t, evs)
++	if tr := f.traceField(); tr == nil || tr["detail"] != "full" || tr["deep"] != true {
++		t.Fatalf("trace request = %v", tr)
++	}
++	c := countTypes(evs)
++	if c["decode.node"] != 1 || c["decode.lens"] != 1 || c["decode.attn.heads"] != 1 || c["decode.layer"] != 1 {
++		t.Errorf("counts %v", c)
++	}
++	for _, e := range evs {
++		switch e["type"] {
++		case "decode.node", "decode.lens", "decode.attn.heads":
++			if e["step"] != float64(1) {
++				t.Errorf("%s step %v, want 1 (llama-server step 2)", e["type"], e["step"])
++			}
++		case "request.received":
++			if e["detail"] != "deep" {
++				t.Errorf("request.received detail = %v", e["detail"])
++			}
++		}
++	}
++
++	f, r = newFakeLlamaServer(t, true, stream)
++	evs = tracedCompletion(t, r, "rt-deep-full", "full", "")
++	if tr := f.traceField(); tr == nil || tr["detail"] != "full" || tr["deep"] != nil {
++		t.Fatalf("trace request at full = %v", tr)
++	}
++	c = countTypes(evs)
++	if c["decode.node"]+c["decode.lens"]+c["decode.attn.heads"] != 0 || c["decode.layer"] != 1 {
++		t.Errorf("counts at full %v", c)
++	}
++}
++
+ // Without runner tracing (basic detail, a stock runner or tracing disabled)
+ // the llama-server request has no trace field.
+ func TestRunnerTraceNotRequested(t *testing.T) {
+diff --git a/trace/runner.go b/trace/runner.go
+index 3d636adf..5c1d7e05 100644
+--- a/trace/runner.go
++++ b/trace/runner.go
+@@ -35,6 +35,9 @@ var eventDetail = map[string]Detail{
+ 	"decode.sample.stage": Full,
+ 	"stream.chunk":        Full,
+ 	"decode.moe":          Full,
++	"decode.node":         Deep,
++	"decode.lens":         Deep,
++	"decode.attn.heads":   Deep,
+ }
+ 
+ // SetRunnerPatched records whether the llama-server behind this request has
+diff --git a/trace/runner_test.go b/trace/runner_test.go
+index 7a8a736b..e1569c20 100644
+--- a/trace/runner_test.go
++++ b/trace/runner_test.go
+@@ -35,19 +35,23 @@ func TestAllowedFollowsDetail(t *testing.T) {
+ 	e := testEmitter(t)
+ 	layers := e.newRequest("a1", "layers", "")
+ 	full := e.newRequest("a2", "full", "")
+-	for typ, want := range map[string][2]bool{
+-		"decode.sample":       {true, true},
+-		"prefill.batch":       {true, true},
+-		"step.timeout":        {true, true},
+-		"decode.layer":        {true, true},
+-		"decode.op":           {false, true},
+-		"decode.attn":         {false, true},
+-		"decode.sample.stage": {false, true},
+-		"decode.moe":          {false, true},
+-		"bogus":               {false, false},
++	deep := e.newRequest("a6", "deep", "")
++	for typ, want := range map[string][3]bool{
++		"decode.sample":       {true, true, true},
++		"prefill.batch":       {true, true, true},
++		"step.timeout":        {true, true, true},
++		"decode.layer":        {true, true, true},
++		"decode.op":           {false, true, true},
++		"decode.attn":         {false, true, true},
++		"decode.sample.stage": {false, true, true},
++		"decode.moe":          {false, true, true},
++		"bogus":               {false, false, false},
++		"decode.node":         {false, false, true},
++		"decode.lens":         {false, false, true},
++		"decode.attn.heads":   {false, false, true},
+ 	} {
+-		if got := [2]bool{layers.Allowed(typ), full.Allowed(typ)}; got != want {
+-			t.Errorf("%s: layers/full = %v, want %v", typ, got, want)
++		if got := [3]bool{layers.Allowed(typ), full.Allowed(typ), deep.Allowed(typ)}; got != want {
++			t.Errorf("%s: layers/full/deep = %v, want %v", typ, got, want)
+ 		}
+ 	}
+ 
+diff --git a/trace/tracer.go b/trace/tracer.go
+index d49d3cae..e80dd80b 100644
+--- a/trace/tracer.go
++++ b/trace/tracer.go
+@@ -22,6 +22,9 @@ const (
+ 	Basic Detail = iota
+ 	Layers
+ 	Full
++	// Deep adds decode.node, decode.lens and decode.attn.heads (llama-server only):
++	// every graph node of each decode layer, a logit lens and per-head attention rows.
++	Deep
+ )
+ 
+ func (d Detail) String() string {
+@@ -30,12 +33,14 @@ func (d Detail) String() string {
+ 		return "layers"
+ 	case Full:
+ 		return "full"
++	case Deep:
++		return "deep"
+ 	default:
+ 		return "basic"
+ 	}
+ }
+ 
+-// ParseDetail parses basic|layers|full. Unknown values yield Basic, false.
++// ParseDetail parses basic|layers|full|deep. Unknown values yield Basic, false.
+ func ParseDetail(s string) (Detail, bool) {
+ 	switch strings.ToLower(strings.TrimSpace(s)) {
+ 	case "basic":
+@@ -44,6 +49,8 @@ func ParseDetail(s string) (Detail, bool) {
+ 		return Layers, true
+ 	case "full":
+ 		return Full, true
++	case "deep":
++		return Deep, true
+ 	}
+ 	return Basic, false
+ }
+-- 
+2.47.1.windows.2
+

@@ -1,7 +1,7 @@
 From 01bc7f6d9eab48412bb927df8565f1e0e142135d Mon Sep 17 00:00:00 2001
 From: Rasheed <arasheedu@gmail.com>
 Date: Thu, 29 Oct 2026 15:21:55 -0700
-Subject: [PATCH 3/6] server: per-request inference tracing for the visualizer
+Subject: [PATCH 3/7] server: per-request inference tracing for the visualizer
 
 [visualizer-trace] A request with a "trace" object gets __trace events on
 its response chunks: decode.layer/op/residual/attn/kv.write/moe from the

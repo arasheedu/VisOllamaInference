@@ -56,7 +56,7 @@ export function layerNodes(d: ModelDims, nKv: number): NodeTemplate[] {
     { name: 'ffn_norm', op: 'MUL', shape: [E], src: [15], group: 4, w: 0.6 },
     { name: 'ffn_gate', op: 'MUL_MAT', shape: [F], src: [16], group: 5, w: 1 },
     { name: 'ffn_up', op: 'MUL_MAT', shape: [F], src: [16], group: 5, w: 1 },
-    { name: 'ffn_swiglu', op: 'GLU', shape: [F], src: [17, 18], group: 6, w: 1 },
+    { name: 'ffn_swiglu', op: 'SWIGLU', shape: [F], src: [17, 18], group: 6, w: 1 },
     { name: 'ffn_out', op: 'MUL_MAT', shape: [E], src: [19], group: 7, w: 5 },
     { name: 'l_out', op: 'ADD', shape: [E], src: [20, 14], group: 7, w: 0.3 },
   ];

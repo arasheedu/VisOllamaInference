@@ -1,7 +1,7 @@
 # Ollama instrumentation notes
 
 Checkout: `ollama/` at v0.40.13 + 2 commits (`8861adaa`), `LLAMA_CPP_VERSION = b11963`, `go.mod` requires Go 1.26.10.
-Branch `visualizer-trace` adds 10 commits (`00*.patch`). Build and run instructions are in `build.md`.
+Branch `visualizer-trace` adds 12 commits (`00*.patch`). Build and run instructions are in `build.md`.
 The llama.cpp side is described in `llama.cpp/README.md`.
 
 ## Architecture (differs from the original plan)
@@ -41,6 +41,7 @@ or in `layer`/`sample` step mode:
 | `decode.step.start` | Go, one per generated token | `t_ns` = first runner event of the step; `kv_used` = prompt tokens + step |
 | `decode.layer` (`device`, `norm` at full) | **llama-server** | every step < 8, then every `OLLAMA_TRACE_LAYER_STRIDE`-th (default 4) |
 | `decode.op`, `decode.residual`, `decode.kv.write`, `decode.attn`, `decode.moe` | **llama-server** (`full`) | attention on every `OLLAMA_TRACE_ATTN_LAYERS`-th layer (default 4), heads averaged unless `OLLAMA_TRACE_ATTN_HEADS` |
+| `decode.node`, `decode.lens`, `decode.attn.heads` | **llama-server** (`deep`) | every layer of each traced step (stride as above; step mode forces 1). See `llama.cpp/README.md` §10 |
 | `decode.sample.stage` | **llama-server** (`full`, or `sample` step mode) | the real chain in llama.cpp order, e.g. `raw → top_k → top_p → temperature → softmax → draw` for Ollama's defaults (penalties, DRY, min-p 0 etc. are no-ops and not emitted) |
 | `decode.sample` | **llama-server** | real `chosen_id` and `method`; `temp`/`top_p` rounded from float32 (0.8, not 0.800000011920929). Go synthesises it only for a step llama-server sent none for. |
 | `decode.logits` | Go: `n_probs` / `top_logprobs` (top 10) | still the pre-sampling distribution from llama-server's probabilities |
@@ -60,7 +61,7 @@ tier (below). The llama-server request then has no `trace` field.
   {"id_slot":2147483647}`. A patched server answers 409 (no such slot in step mode; this never
   counts as an ack), and a stock one 404. On a stock runner the request runs untraced on the
   llama.cpp side and layer/sample step mode falls back to the Go token gate.
-- **Request.** `trace: {detail: "layers"|"full", layer_stride, attn_layers, attn_heads[, step, step_timeout_ms]}`
+- **Request.** `trace: {detail: "layers"|"full", layer_stride, attn_layers, attn_heads[, step, step_timeout_ms][, deep: true]}`
   is added to `/completion` and `/v1/chat/completions` requests. Basic-detail requests with layer
   step mode send `detail: "layers"`.
 - **Chunks.** `__trace`, `__trace_t_ns`, `__trace_caps` and `__trace_slot` are parsed from every SSE chunk,
@@ -84,7 +85,8 @@ tier (below). The llama-server request then has no `trace` field.
   with exactly one `decode.logits` and one `decode.sample` per step. A grammar resample's second
   `raw…draw` sequence is passed through.
 - **Detail filtering.** `layers` forwards `decode.layer` and the basic-tier types and drops the
-  full-tier ones. `full` forwards everything the schema knows; unknown types are dropped. In
+  full-tier ones. `full` forwards everything the schema knows except the deep tier; `deep` adds
+  `decode.node`, `decode.lens` and `decode.attn.heads`. Unknown types are dropped. In
   step mode, `layer` also lets `decode.layer` through and `sample` lets `decode.sample.stage` through,
   since those are the events the runner pauses on.
 - **`__trace_caps`** (e.g. `no_attn`, `no_sample_stages`, `no_step`) is logged
@@ -211,3 +213,30 @@ Earlier Go-only numbers (stock 0.40.6 payload): off 105.1, `basic` 94.7 tok/s.
 - `Session.continue()` resumes the clock but doesn't clear a pending *Step token/layer* stop
   (`clock.stopWhen`). If Continue is clicked while a step is still pending, playback pauses again at
   the next matching event, and the run stays in "decoding" until *Play* is pressed.
+
+## Deep tier (commits 0011–0012)
+
+- `trace.Deep` (> `Full`): `ParseDetail("deep")`, `String() == "deep"`, so `request.received.detail`
+  is `"deep"`. `eventDetail` adds `decode.node`, `decode.lens`, `decode.attn.heads` at `Deep`;
+  everything allowed at `Full` is allowed at `Deep`.
+- The runner request is `detail: "full", deep: true` (`runnerTraceRequest.Deep`, omitted below
+  Deep, so `full` requests are byte-identical to before). `lens_topk` / `attn_window` use the
+  llama-server defaults (5 / 512); there are no env vars for them.
+- Steps: the generic step shift in `parseRunnerEvent` applies, so the new events are 0-based like
+  `decode.layer` (first decode pass = step 1).
+- Unit tests: `TestAllowedFollowsDetail` (deep column), `TestRunnerTraceDeep` (request field, step
+  shift, forwarded at deep, dropped at full).
+
+Measured through `C:\ollama-trace-deep` (CUDA, `/api/chat`, llama3.2, temperature 0, 107 tokens,
+3 runs, `OLLAMA_TRACE_LAYER_STRIDE=1`, recording hub):
+
+| Detail | tok/s | events / request |
+|---|---|---|
+| `basic` | 99.0 | – |
+| `full` | 49.5 | – |
+| `deep` | 14.0 (15.30 / 13.54 / 13.21) | 94,173, 0 dropped, `seq` contiguous |
+
+With the default stride 4, 40 tokens: `basic` 100.7, `full` 69.2, `deep` 37.6 tok/s. Text md5
+identical across all of them. Layer step mode at deep: 3 decode passes × 28 layer pauses acked,
+each pause flushes that layer's nodes and lens. Deep events are droppable; at ~880 events per
+token the emitter kept up at 14 tok/s, but a slow hub can make it drop them (see Performance).

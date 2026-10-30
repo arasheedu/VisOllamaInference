@@ -66,6 +66,24 @@ are emitted for **every layer** of each traced step (still subject to `layer_str
 forces stride 1). The existing `full` events keep being emitted. New capability values:
 `no_lens` (model has no output head reachable), `no_nodes`.
 
+## What the llama-server patch actually emits
+
+Checked on llama3.2 (see `ollama-patch/llama.cpp/README.md` §10 for details and benchmarks):
+
+- `op` is `ggml_op_desc()`, so gated activations report the sub-op (`SWIGLU`, not `GLU`).
+- Unnamed nodes are named after their op, lowercased: `flash_attn_ext`, `set_rows` (the K and V
+  cache stores; the app labels them from their source), `get_rows`.
+- With flash attention (the default) a layer has 19 nodes: `norm, attn_norm, Qcur, Qcur(ROPE),
+Vcur, Kcur, Kcur(ROPE), set_rows ×2, flash_attn_ext, attn_out, ffn_inp, norm, ffn_norm, ffn_gate,
+ffn_up, ffn_swiglu, ffn_out, l_out`. Without it, 22 (`kq, kq_soft_max, kqv, kqv_out` replace the
+  flash node). The last layer has two extra `get_rows` nodes.
+- `stats` are omitted for results that alias another buffer (the KV-cache stores).
+- `decode.attn.heads` rows end at the last KV cell any head attends to (the KV view itself is
+  padded to 256 cells).
+- Layer 0's lens on llama3.2 predicts the input token with p ≈ 1 (tied embeddings).
+- Cost on an RTX 4060 (llama3.2 3B): about 66 ms per deep token; 13 tok/s at stride 1 vs 109
+  untraced. Through Ollama: 14 tok/s at stride 1, 37.6 at the default stride 4.
+
 ## Ollama
 
 - `X-Trace-Detail: deep` (and `OLLAMA_TRACE_DETAIL=deep`) → detail level `Deep` (> `Full`).
