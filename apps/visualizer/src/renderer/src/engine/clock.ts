@@ -239,7 +239,9 @@ export class PlaybackClock {
       if (e.t_ns > this.tp) this.tp = e.t_ns;
       const h = this.holdFor(e);
       if (h) {
-        const ms = h.ms / this.catchup / Math.max(this.userSpeed, 1e-3);
+        // "Step token" sweeps through layers and ops quickly; finer steps keep their pace
+        const sweep = h.kind === 'sub' && this.stopWhen && this.stoppingLabel === 'token' ? 0.1 : 1;
+        const ms = (h.ms * sweep) / this.catchup / Math.max(this.userSpeed, 1e-3);
         if (h.kind === 'stage') this.stageHoldUntil = wall + ms;
         else this.subHoldUntil = wall + ms;
       }

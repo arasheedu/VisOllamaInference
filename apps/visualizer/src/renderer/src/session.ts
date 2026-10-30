@@ -569,7 +569,35 @@ export class Session {
       if (now - run.lastAckWall < 1500) return;
     }
     if (now - p.headWall() < 30 && run.acksSent > 0) return;
-    this.sendAck(run);
+    const n = this.acksToNextToken(run, p);
+    for (let i = 0; i < n; i++) this.sendAck(run);
+  }
+
+  /**
+   * The runner pauses after every layer (layer granularity), but "Step token"
+   * or "Step sampling stage" needs the whole rest of the forward pass. Acks are
+   * counted by the runner, so send one per remaining layer pause at once
+   * instead of one round trip per layer. Otherwise one ack.
+   */
+  private acksToNextToken(run: RunState, p: Player): number {
+    const kind = p.clock.stoppingLabel;
+    if (run.source === 'mock' || this.settings.stepGranularity !== 'layer') return 1;
+    if (kind !== 'token' && kind !== 'sample') return 1;
+    const L = p.machine.current.layersCount;
+    if (!L) return 1;
+    // layers already shown for the step the runner is in
+    let step = -1;
+    for (let i = p.events.length - 1; i >= 0; i--) {
+      const e = p.events[i];
+      if (e.type === 'decode.layer') {
+        step = e.step;
+        break;
+      }
+    }
+    const seen =
+      step >= 0 ? new Set(p.machine.current.steps[step]?.layerMs.map((l) => l.layer)).size : 0;
+    // pauses left: the one the runner is waiting at, plus one per layer still to run
+    return Math.max(1, Math.min(L, L - seen + 1));
   }
 
   // ---- files ------------------------------------------------------------
