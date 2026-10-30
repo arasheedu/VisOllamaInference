@@ -262,6 +262,7 @@ export class Session {
     if (p) {
       vm = p.tick(now);
       this.pumpAcks(now);
+      this.updateStepWaiting(p, now);
       this.checkRunComplete();
       if (vm !== this.lastVm) {
         this.lastVm = vm;
@@ -559,6 +560,25 @@ export class Session {
    * Live step mode: when the player wants more events than are buffered, ack
    * the runner — once per gate (only after new events arrived since the last).
    */
+  /**
+   * Live step mode with no step requested: the runner sits at a gate and the
+   * buffer has played out. Flag it after a short grace period so the UI can say so.
+   */
+  private updateStepWaiting(p: Player, now: number) {
+    const run = this.run;
+    const idle =
+      !!run &&
+      run.step &&
+      !run.released &&
+      !run.traceDone &&
+      p.req === run.req &&
+      !p.clock.stopWhen &&
+      p.atEnd &&
+      p.machine.current.phase !== 'loading' &&
+      now - p.headWall() > 400;
+    if (idle !== useUi.getState().stepWaiting) setUi({ stepWaiting: idle });
+  }
+
   private pumpAcks(now: number) {
     const run = this.run;
     const p = this.active;

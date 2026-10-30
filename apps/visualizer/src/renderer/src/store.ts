@@ -54,6 +54,8 @@ export interface UiState {
   deepLayer: number | null;
   /** deep detail: which view fills the middle panel */
   deepTab: 'layer' | 'forward';
+  /** live step-mode run held at a runner gate until the user steps */
+  stepWaiting: boolean;
 }
 
 export const useUi = create<UiState>(() => ({
@@ -78,6 +80,7 @@ export const useUi = create<UiState>(() => ({
   fps: 0,
   deepLayer: null,
   deepTab: 'layer',
+  stepWaiting: false,
 }));
 
 export const setUi = useUi.setState;

@@ -1048,3 +1048,13 @@ textarea:focus {
 .deep-particle {
   filter: drop-shadow(0 0 3px currentColor);
 }
+.badge.step-wait {
+  font-size: 12px;
+  padding: 4px 10px;
+  animation: step-wait-pulse 1.6s ease-in-out infinite;
+}
+@keyframes step-wait-pulse {
+  50% {
+    box-shadow: 0 0 0 3px #fbbf2433;
+  }
+}

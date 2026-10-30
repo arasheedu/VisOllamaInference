@@ -22,8 +22,16 @@ function CenterBadges() {
   const detail = useUi((s) => s.settings.detail);
   const missingFull =
     detail !== 'basic' && capabilities.some((x) => x === 'no_layers' || x === 'no_ops');
+  // step mode holds the run until the user steps: make that impossible to miss
+  const waiting = useUi((s) => s.stepWaiting);
   return (
     <div className="badges">
+      {waiting && (
+        <span className="badge hot step-wait" data-testid="step-waiting">
+          ⏸ Step mode: waiting for you. Use Step op / layer / token below, or Continue to play it
+          out (untick Step to run live).
+        </span>
+      )}
       {missingFull && (
         <span className="badge" title={capabilities.join(', ')}>
           runner has no per-layer data

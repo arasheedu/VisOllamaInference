@@ -1,6 +1,7 @@
 // Real Deep run WITHOUT step mode: does the UI keep up and reach Done? Usage:
 //   npx tsx e2e/probe-real-deep-live.ts <outDir> <ollama.exe> [model]
 import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import { launch } from './helpers';
 
 const out = process.argv[2] ?? '.';
@@ -25,6 +26,7 @@ const HTTP = 11439;
       ...process.env,
       OLLAMA_HOST: `127.0.0.1:${HTTP}`,
       OLLAMA_TRACE_URL: `ws://127.0.0.1:${PORT}/ingest`,
+      ...(process.env.CPU_ONLY ? { CUDA_VISIBLE_DEVICES: '-1' } : {}),
     },
     stdio: 'ignore',
   });
@@ -68,9 +70,32 @@ const HTTP = 11439;
       models.find((m) => m.startsWith(model))!,
     );
     if (process.env.STEP) await page.check('[data-testid=step-mode]');
-    await page.fill('[data-testid=prompt]', 'Why is the sky blue? Answer in three sentences.');
+    await page.fill(
+      '[data-testid=prompt]',
+      process.env.DEEP_PROMPT ?? 'Why is the sky blue? Answer in three sentences.',
+    );
+    const cdp = process.env.PROFILE ? await page.context().newCDPSession(page) : null;
+    if (cdp) {
+      await cdp.send('Profiler.enable');
+      await cdp.send('Profiler.setSamplingInterval', { interval: 500 });
+      await cdp.send('Profiler.start');
+    }
+    await page.evaluate(() => {
+      const w = window as any;
+      w.__long = [];
+      new PerformanceObserver((l) => {
+        for (const e of l.getEntries())
+          w.__long.push([Math.round(e.startTime), Math.round(e.duration)]);
+      }).observe({ type: 'long-animation-frame', buffered: false });
+    });
     await page.click('[data-testid=run]');
     const t0 = Date.now();
+    if (cdp)
+      setTimeout(async () => {
+        const { profile } = await cdp.send('Profiler.stop');
+        writeFileSync(out + '/deep.cpuprofile', JSON.stringify(profile));
+        console.log('profile saved');
+      }, 16000);
     if (process.env.STEP) {
       await page.waitForFunction(
         () => (window as any).__viz.useUi.getState().vm.phase === 'decoding',
@@ -78,7 +103,13 @@ const HTTP = 11439;
         { timeout: 60_000 },
       );
       await page.waitForTimeout(1500);
-      console.log('at decode', JSON.stringify(await state()));
+      console.log(
+        'at decode',
+        JSON.stringify(await state()),
+        'banner visible:',
+        await page.locator('[data-testid=step-waiting]').isVisible(),
+      );
+      await page.screenshot({ path: `${out}/step-waiting.png` });
       for (let k = 0; k < 3; k++) {
         const before = (await state()).tokens;
         const ts = Date.now();
@@ -96,12 +127,22 @@ const HTTP = 11439;
       }
       await page.getByRole('button', { name: 'Continue' }).click();
     }
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 60; i++) {
       await page.waitForTimeout(3000);
       const st = await state();
       console.log(`${Math.round((Date.now() - t0) / 1000)}s`, JSON.stringify(st));
       if (st.phase === 'done' || st.phase === 'error') break;
     }
+    const long = await page.evaluate(() => (window as any).__long as number[][]);
+    long.sort((a, b) => b[1] - a[1]);
+    console.log(
+      'LONG FRAMES',
+      long.length,
+      'total',
+      long.reduce((a, x) => a + x[1], 0),
+      'ms; worst',
+      JSON.stringify(long.slice(0, 8)),
+    );
     await page.screenshot({ path: `${out}/deep-live.png` });
     console.log('errors', errors.slice(0, 5));
   } finally {
