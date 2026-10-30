@@ -75,6 +75,35 @@ function useStageSource(): StepDetail | null {
   }, [sd, steps]);
 }
 
+/** Empty state: sampling runs only after the last layer of the first token. */
+function SamplerWaiting() {
+  const phase = useUi((s) => s.vm.phase);
+  const n = useUi((s) => s.vm.layersCount);
+  const lastLayer = useUi((s) => {
+    const sd = s.vm.stepDetail;
+    let m = -1;
+    for (const x of sd?.layerMs ?? []) m = Math.max(m, x.layer);
+    for (const x of sd?.ops ?? []) m = Math.max(m, x.layer);
+    return m;
+  });
+  if (phase !== 'prefill' && phase !== 'decoding')
+    return <>The sampling chain appears here once the first token is being picked.</>;
+  return (
+    <>
+      Sampling starts after the last layer.
+      {n > 0 && lastLayer >= 0 && (
+        <>
+          {' '}
+          The forward pass is at layer {lastLayer + 1} of {n}.
+        </>
+      )}
+      <br />
+      Press <b>Step layer</b> until the last layer finishes, or <b>Step sampling stage</b> to jump
+      straight to it.
+    </>
+  );
+}
+
 export function SamplingFunnel() {
   const detail = useStageSource();
   const rm = useReducedMotion();
@@ -105,10 +134,12 @@ export function SamplingFunnel() {
 
   if (!detail || !stages.length) {
     return (
-      <div className="funnel" style={{ color: 'var(--muted)', padding: 12 }}>
-        {noStages
-          ? 'This runner does not report sampler stages (stock llama-server). Build Ollama with the llama.cpp trace patch for the full sampling chain; top-k probabilities are in Basic/Layers view.'
-          : 'Waiting for sampler stages… (Full detail)'}
+      <div className="funnel" style={{ color: 'var(--muted)', padding: 12, lineHeight: 1.5 }}>
+        {noStages ? (
+          'This runner does not report sampler stages (stock llama-server). Build Ollama with the llama.cpp trace patch for the full sampling chain; top-k probabilities are in Basic/Layers view.'
+        ) : (
+          <SamplerWaiting />
+        )}
       </div>
     );
   }
