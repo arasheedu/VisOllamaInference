@@ -210,9 +210,8 @@ Earlier Go-only numbers (stock 0.40.6 payload): off 105.1, `basic` 94.7 tok/s.
   60–110 tok/s) and degrades by design. It skips full-tier events while lagging, so the forward-pass
   and sampling panels can be empty at the end of a live run. Replaying the run (seek or step) shows
   all the data.
-- `Session.continue()` resumes the clock but doesn't clear a pending *Step token/layer* stop
-  (`clock.stopWhen`). If Continue is clicked while a step is still pending, playback pauses again at
-  the next matching event, and the run stays in "decoding" until *Play* is pressed.
+- Fixed since: `Session.continue()` used to leave a pending *Step token/layer* stop
+  (`clock.stopWhen`) in place, so playback paused again at the next matching event. It now clears it.
 
 ## Deep tier (commits 0011–0012)
 

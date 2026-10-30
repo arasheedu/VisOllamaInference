@@ -18,7 +18,7 @@ the same `ollama.exe` falls back to the basic tier and reports `no_layers`, `no_
 git clone https://github.com/ollama/ollama.git
 cd ollama
 git checkout 8861adaa77839c961d3c574232a8865d65a426b6
-git am ..\ollama-patch\00*.patch        # 10 commits, applies cleanly
+git am ..\ollama-patch\00*.patch        # 12 commits, applies cleanly
 ```
 
 The checkout at `ollama/` already has these commits on branch `visualizer-trace`.

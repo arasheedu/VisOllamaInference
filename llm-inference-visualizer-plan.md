@@ -6,6 +6,36 @@ This plan is written for execution by Claude Code. Each phase is self-contained,
 
 ---
 
+## As built (review after implementation, 2026-10-30)
+
+The phases below are the original plan, unchanged. All phases were implemented. Where the plan turned out to be wrong or a target was missed, this section is the source of truth. Details: `ollama-patch/NOTES.md`, `ollama-patch/llama.cpp/README.md`, `docs/deep-tier.md`.
+
+### Plan assumptions that did not hold
+- **No Go runner (Phase 5).** Ollama v0.40.13 has no `runner/`, `ollamarunner` or Go GGML engine. Every GGUF model runs in an upstream llama.cpp `llama-server` subprocess. Layer, op, residual, attention, KV-write and sampler-stage events come from a llama.cpp C++ patch (`ollama-patch/llama.cpp/`, 7 commits); the Go patch forwards them from llama-server's stream.
+- **Sampler stage order (Phases 1, 4b, 5).** llama.cpp's chain order with Ollama's defaults is `raw → top_k → top_p → temperature → softmax → draw`. Temperature comes after the cutoffs; no-op stages (penalties, DRY, min-p 0, …) are not emitted. `decode.sample.stage.stage` is therefore a free string, not an enum. Greedy sampling has no `draw` value.
+- **Attention capture.** Flash attention is on by default (`--flash-attn auto`), so there is no softmaxed KQ tensor. The patch rebuilds the current token's attention row on the CPU from the flash-attention node's inputs; without FA it reads `kq_soft_max` directly.
+- **Op timing is not cheap.** Every node the eval callback observes forces a backend synchronise and disables CUDA-graph replay. GPU op timings are coarse, and `full` costs ~35 % inside llama-server alone.
+- **Op granularity.** The 7 `decode.op` classes summarise ~19–22 real graph nodes per layer. The real nodes are exposed by a fourth detail level, **Deep** (`decode.node`, `decode.lens` logit lens, `decode.attn.heads`); see `docs/deep-tier.md`.
+- **`decode.logits`** comes from llama-server's top-10 probabilities (`n_probs`), not from the sampler's candidate list.
+- **Token step mode** gates the events Ollama forwards; llama-server keeps generating ahead. Only layer and sample step modes pause the model itself (`POST /trace/ack`).
+- **Ring buffer.** 50k events is too small (Full at stride 1 ≈ 300 events/token, Deep ≈ 880). The cap is 200k, compacted in place.
+- **WebSocket library.** `nhooyr.io/websocket` was renamed; the emitter uses `coder/websocket`.
+- **Mock port.** `mock-ollama-http` defaults to 11434, which clashes with a real Ollama. The app's in-app mock source avoids this.
+
+### Targets
+| Target | Result |
+|---|---|
+| < 2 % overhead at `basic` | **−9.1 %**, ~7 points of which are llama-server computing the probabilities the top-k panel needs; not reachable |
+| < 10 % at `layers` | **−14.1 %** |
+| < 40 % at `full` | **−40.8 %** with attention every 4th layer (the plan's fallback, now the default) |
+| Deep (not in plan) | 37.6 tok/s at stride 4, 14 tok/s at stride 1 (vs 100.7 basic) |
+| 60 fps, 80 layers, 4k context | met (`e2e/probe-perf.ts`) |
+| Real traces: 3 models at `basic` and `full` | 2 models: llama3.2 3B (basic + full), qwen3 8B (basic only); no large model |
+| JS tokenizer matches `tokenize.done` per model | matches llama3.2 and qwen3 8B, checked by hand, not in an automated test |
+| `git am` applies cleanly | met (12 commits) |
+
+---
+
 ## Guiding decisions (do not re-litigate during implementation)
 
 | Concern | Decision |
