@@ -136,7 +136,7 @@ const TokenSpan = memo(function TokenSpan({
       onMouseMove={(e) => onHover(e, t)}
       onMouseLeave={onLeave}
       onClick={() => {
-        session.pause();
+        session.pauseToInspect();
         setUi({ inspector: { kind: 'token', step: t.step } });
       }}
     >

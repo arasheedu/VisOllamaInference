@@ -500,6 +500,14 @@ export class Session {
   pause() {
     this.active?.clock.pause();
   }
+  /**
+   * Clicking something to inspect it freezes a replay, but never a live run:
+   * the runner keeps generating and a frozen display looks like a hang.
+   */
+  pauseToInspect() {
+    if (this.run && !this.run.chatDone && this.active?.req === this.run.req) return;
+    this.pause();
+  }
   resume() {
     this.active?.clock.resume();
   }

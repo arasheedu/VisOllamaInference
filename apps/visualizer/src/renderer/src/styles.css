@@ -1058,3 +1058,6 @@ textarea:focus {
     box-shadow: 0 0 0 3px #fbbf2433;
   }
 }
+.badges .badge.step-wait {
+  pointer-events: auto;
+}

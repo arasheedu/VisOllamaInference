@@ -214,7 +214,7 @@ export function LayerCanvas() {
         const vm = vmRef.current;
         if (layer < 0 || !vm) return;
         setUi({ inspector: { kind: 'layer', step: vm.currentStep, layer } });
-        session.pause();
+        session.pauseToInspect();
       }}
     >
       <div style={{ position: 'absolute', right: 10, bottom: 2, zIndex: 2 }} className="seg">

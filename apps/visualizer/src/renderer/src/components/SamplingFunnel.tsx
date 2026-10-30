@@ -224,7 +224,7 @@ export function SamplingFunnel() {
           <div key={name} className={`stage${isCur ? ' current' : ''}`}>
             <header
               onClick={() => {
-                session.pause();
+                session.pauseToInspect();
                 setUi({ inspector: { kind: 'stage', step, stage: name } });
               }}
             >

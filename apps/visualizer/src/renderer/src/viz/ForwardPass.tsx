@@ -671,7 +671,7 @@ export function ForwardPass() {
         const c = COLS[h.col];
         if (c.op === 'residual') setUi({ inspector: { kind: 'layer', step, layer: h.layer } });
         else setUi({ inspector: { kind: 'op', step, layer: h.layer, op: c.op, slot: c.slot } });
-        session.pause();
+        session.pauseToInspect();
       }}
     >
       {hover && (

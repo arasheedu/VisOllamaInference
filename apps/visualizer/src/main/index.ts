@@ -8,6 +8,9 @@ const DEFAULT_PORT = Number(process.env.TRACE_PORT) || 4711;
 
 // isolated profile for tests / multiple instances
 if (process.env.VISUALIZER_USER_DATA) app.setPath('userData', process.env.VISUALIZER_USER_DATA);
+// opt-in Chrome DevTools Protocol port, for attaching profilers / test drivers to a dev session
+if (process.env.VISUALIZER_CDP_PORT)
+  app.commandLine.appendSwitch('remote-debugging-port', process.env.VISUALIZER_CDP_PORT);
 
 interface MainSettings {
   port: number;

@@ -12,6 +12,7 @@ import { ForwardPass } from './viz/ForwardPass';
 import { MoePanel } from './components/MoePanel';
 import { DeepView } from './components/DeepView';
 import { atLeast } from 'trace-schema';
+import { session } from './session';
 import { setUi, useUi } from './store';
 import { useReducedMotion } from './theme';
 import { dilationLabel } from './components/Timeline';
@@ -24,8 +25,20 @@ function CenterBadges() {
     detail !== 'basic' && capabilities.some((x) => x === 'no_layers' || x === 'no_ops');
   // step mode holds the run until the user steps: make that impossible to miss
   const waiting = useUi((s) => s.stepWaiting);
+  // a paused display during a live run (not step mode) also looks like a hang
+  const livePaused = useUi(
+    (s) => s.running && !s.stepMode && s.vm.clock.paused && s.vm.phase !== 'done',
+  );
   return (
     <div className="badges">
+      {livePaused && (
+        <span className="badge hot step-wait" data-testid="live-paused">
+          ⏸ Playback paused while the model keeps generating.{' '}
+          <button onClick={() => session.resume()} style={{ fontSize: 11, padding: '0 8px' }}>
+            Resume
+          </button>
+        </span>
+      )}
       {waiting && (
         <span className="badge hot step-wait" data-testid="step-waiting">
           ⏸ Step mode: waiting for you. Use Step op / layer / token below, or Continue to play it
