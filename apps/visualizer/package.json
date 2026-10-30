@@ -7,7 +7,7 @@
     "name": "Rasheed",
     "email": "arasheedu@gmail.com"
   },
-  "homepage": "https://github.com/arasheedu/VisOllamInference",
+  "homepage": "https://github.com/arasheedu/VisOllamaInference",
   "license": "MIT",
   "type": "module",
   "main": "out/main/index.js",
