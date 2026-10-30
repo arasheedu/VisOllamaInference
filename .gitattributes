@@ -1,0 +1,5 @@
+# Recorded traces and responses are compared byte-for-byte in tests:
+# never convert their line endings on checkout.
+traces/** -text
+*.ndjson -text
+*.response.txt -text

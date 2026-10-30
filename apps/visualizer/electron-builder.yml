@@ -22,5 +22,6 @@ mac:
 linux:
   target: [AppImage, deb]
   category: Development
+  maintainer: Rasheed <arasheedu@gmail.com>
   artifactName: ${productName}-${version}-linux-${arch}.${ext}
 publish: null
