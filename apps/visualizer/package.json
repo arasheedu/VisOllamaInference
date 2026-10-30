@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "LLM Inference Visualizer",
+  "author": "Rasheed <arasheedu@gmail.com>",
+  "homepage": "https://github.com/arasheedu/VisOllamInference",
+  "license": "MIT",
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
