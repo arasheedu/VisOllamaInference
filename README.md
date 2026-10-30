@@ -2,7 +2,7 @@
 
 [![All four detail modes (Basic, Layers, Full, Deep), 6× speed. Click for the full video.](docs/demo.gif)](docs/all-modes.mp4)
 
-_All four detail modes at 6× speed. Click for the full 2-minute video. Re-record with `pnpm record`._
+_All four detail modes at 6× speed. Click for the full 2-minute video. Re-record and rebuild this demo with `pnpm record:demo` (or `pnpm demo` to rebuild from the last recording)._
 
 An Electron app that animates every stage of LLM inference in real time. It follows a prompt through tokenization (with BPE merges), prefill, each decode step's layers, attention, residual stream, KV cache and sampling chain, and into the streamed response. Data comes from an instrumented Ollama build, a built-in mock, or a recorded trace.
 

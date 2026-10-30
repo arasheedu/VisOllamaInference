@@ -14,7 +14,9 @@
     "mock": "pnpm --filter trace-mock cli",
     "mock-ollama-http": "pnpm --filter trace-mock http",
     "gen-fixtures": "pnpm --filter trace-mock gen-fixtures",
-    "record": "pnpm --filter visualizer build && pnpm --filter visualizer record"
+    "record": "pnpm --filter visualizer build && pnpm --filter visualizer record",
+    "demo": "node scripts/make-demo.mjs",
+    "record:demo": "pnpm record && pnpm demo"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
