@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { session } from '../session';
 import { setUi, useUi } from '../store';
-import { OP_COLOR, showToken } from '../theme';
+import { OP_COLOR, showToken, useReducedMotion } from '../theme';
 import type { NodeState, StepDetail, ViewModel } from '../engine/types';
 
 // ---- data helpers -----------------------------------------------------------
@@ -313,6 +313,7 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
   const ran = useMemo(() => new Map(nodes.map((n) => [n.i, n])), [nodes]);
   const [hover, setHover] = useState<{ i: number; x: number; y: number } | null>(null);
   const lastWall = nodes.reduce((m, n) => Math.max(m, n.wall), -Infinity);
+  const reduced = useReducedMotion();
   const maxMs = nodes.reduce((m, n) => Math.max(m, n.ms), 0) || 1;
   const totalMs = nodes.reduce((a, n) => a + n.ms, 0);
   const boxOf = new Map(L.boxes.map((b) => [b.n.i, b]));
@@ -324,9 +325,35 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
       </div>
     );
 
+  // the op that ran last: its incoming arrows carry the data flow animation
+  let hotI = -1;
+  if (lastWall > -Infinity)
+    for (const n of nodes) if (n.wall === lastWall) hotI = Math.max(hotI, n.i);
+  const edge = (key: string, d: string, cls: string, hot: boolean, color: string) => {
+    if (!hot)
+      return <path key={key} d={d} className={`deep-edge ${cls}`} markerEnd="url(#deep-arrow)" />;
+    return (
+      <g key={`${key}-${lastWall}`} className="deep-flow">
+        <path
+          d={d}
+          className="deep-edge hot"
+          style={{ stroke: color }}
+          markerEnd="url(#deep-arrow-hot)"
+        />
+        {!reduced &&
+          [0, 0.33, 0.66].map((t) => (
+            <circle key={t} r={3.2} fill={color} className="deep-particle">
+              <animateMotion dur="1.1s" begin={`${t * 1.1}s`} repeatCount="indefinite" path={d} />
+            </circle>
+          ))}
+      </g>
+    );
+  };
   const edges: ReactNode[] = [];
+  const hotEdges: ReactNode[] = [];
   for (const b of L.boxes) {
     const live = ran.has(b.n.i);
+    const hot = b.n.i === hotI;
     for (const s of b.n.src ?? []) {
       const a = boxOf.get(s);
       if (!a) continue;
@@ -346,26 +373,28 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
         const k = Math.max(30, (y2 - y1) / 2);
         d = `M${x1},${y1} C${x1},${y1 + k} ${x2},${y2 - k} ${x2},${y2}`;
       }
-      const res = groupOf(a.n.name, a.n.op) === 'residual';
-      edges.push(
-        <path
-          key={`${s}-${b.n.i}`}
-          d={d}
-          className={`deep-edge ${res ? 'res' : ''} ${live ? '' : 'pending'}`}
-          markerEnd="url(#deep-arrow)"
-        />,
+      const g = groupOf(a.n.name, a.n.op);
+      (hot ? hotEdges : edges).push(
+        edge(
+          `${s}-${b.n.i}`,
+          d,
+          `${g === 'residual' ? 'res' : ''} ${live ? '' : 'pending'}`,
+          hot,
+          GROUP_COLOR[g],
+        ),
       );
     }
     if (b.residualIn) {
       // residual stream / layer input enters from the left rail
       const y2 = b.y + BH / 2;
-      edges.push(
-        <path
-          key={`in-${b.n.i}`}
-          d={`M${IN_W - 6},${y2} L${b.x},${y2}`}
-          className={`deep-edge res ${live ? '' : 'pending'}`}
-          markerEnd="url(#deep-arrow)"
-        />,
+      (hot ? hotEdges : edges).push(
+        edge(
+          `in-${b.n.i}`,
+          `M${IN_W - 6},${y2} L${b.x},${y2}`,
+          `res ${live ? '' : 'pending'}`,
+          hot,
+          GROUP_COLOR.residual,
+        ),
       );
     }
   }
@@ -397,6 +426,17 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
             >
               <path d="M0,0 L8,4 L0,8 z" fill="#4b5470" />
             </marker>
+            <marker
+              id="deep-arrow-hot"
+              viewBox="0 0 8 8"
+              refX="7"
+              refY="4"
+              markerWidth="6"
+              markerHeight="6"
+              orient="auto"
+            >
+              <path d="M0,0 L8,4 L0,8 z" fill="#e6e9f2" />
+            </marker>
           </defs>
           {/* residual stream rail */}
           <rect
@@ -422,6 +462,7 @@ function BlockDiagram({ sd, layer }: { sd: StepDetail; layer: number }) {
             </text>
           )}
           {edges}
+          {hotEdges}
           {L.boxes.map((b) => {
             const n = ran.get(b.n.i);
             const g = groupOf(b.n.name, b.n.op);

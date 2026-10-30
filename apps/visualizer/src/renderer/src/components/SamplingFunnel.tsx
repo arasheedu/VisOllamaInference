@@ -162,7 +162,9 @@ export function SamplingFunnel() {
         {noStages ? (
           'This runner does not report sampler stages (stock llama-server). Build Ollama with the llama.cpp trace patch for the full sampling chain; top-k probabilities are in Basic/Layers view.'
         ) : (
-          <SamplerWaiting />
+          <div>
+            <SamplerWaiting />
+          </div>
         )}
       </div>
     );

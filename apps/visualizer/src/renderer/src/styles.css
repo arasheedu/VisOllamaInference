@@ -1034,3 +1034,17 @@ textarea:focus {
   font-size: 11px;
   padding: 1px 8px;
 }
+.deep-edge.hot {
+  stroke-width: 2.2;
+  stroke-dasharray: 6 4;
+  animation: deep-dash 0.6s linear infinite;
+  opacity: 1;
+}
+@keyframes deep-dash {
+  to {
+    stroke-dashoffset: -10;
+  }
+}
+.deep-particle {
+  filter: drop-shadow(0 0 3px currentColor);
+}
