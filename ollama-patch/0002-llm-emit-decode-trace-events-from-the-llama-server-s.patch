@@ -1,7 +1,7 @@
 From eae879fd74739ac32d77ab85991bfef9627c9cc6 Mon Sep 17 00:00:00 2001
 From: Rasheed <arasheedu@gmail.com>
 Date: Thu, 29 Oct 2026 14:53:48 -0700
-Subject: [PATCH 2/3] llm: emit decode trace events from the llama-server
+Subject: [PATCH 02/10] llm: emit decode trace events from the llama-server
  stream
 
 When a request carries a tracer, ask llama-server for top-10 probabilities

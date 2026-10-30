@@ -1,0 +1,40 @@
+From 38de60760d4967d0ba7b93cae246db09429777a5 Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 16:46:52 -0700
+Subject: [PATCH 09/10] server: report runner trace capabilities in
+ request.received
+
+request.received is sent before a runner is scheduled, so whether
+llama-server has the trace patch comes from a cached runner probe or,
+before the first one, a scan of the llama-server binaries.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ server/trace.go | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/server/trace.go b/server/trace.go
+index 8f062f98..50d40b88 100644
+--- a/server/trace.go
++++ b/server/trace.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/gin-gonic/gin"
+ 
+ 	"github.com/ollama/ollama/api"
++	"github.com/ollama/ollama/llm"
+ 	"github.com/ollama/ollama/trace"
+ )
+ 
+@@ -19,6 +20,9 @@ func startTrace(c *gin.Context) *trace.RequestTracer {
+ 	if tr == nil {
+ 		return nil
+ 	}
++	// Decides the capabilities in request.received, which is sent before a
++	// runner is scheduled.
++	tr.SetRunnerPatched(llm.RunnerTraceSupported())
+ 	c.Request = c.Request.WithContext(trace.NewContext(c.Request.Context(), tr))
+ 	c.Header(trace.HeaderRequestID, tr.ID())
+ 	return tr
+-- 
+2.47.1.windows.2
+

@@ -1,0 +1,47 @@
+From c7b6ff79e0a8c95b77d7997c21da2c8850aed852 Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 16:46:52 -0700
+Subject: [PATCH 07/10] envconfig: trace layer stride and attention sampling
+
+OLLAMA_TRACE_LAYER_STRIDE (4), OLLAMA_TRACE_ATTN_LAYERS (4) and
+OLLAMA_TRACE_ATTN_HEADS (off) are passed to llama-server's trace object.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ envconfig/config.go | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/envconfig/config.go b/envconfig/config.go
+index 72ca26c8..d407255d 100644
+--- a/envconfig/config.go
++++ b/envconfig/config.go
+@@ -190,6 +190,16 @@ func TraceStepTimeout() time.Duration {
+ 	return timeout
+ }
+ 
++// Trace sampling passed to a llama-server with the visualizer trace patch at
++// layers/full detail. Layer-level events are kept for every step < 8 and every
++// TraceLayerStride-th step after that; decode.attn covers layers where
++// layer % TraceAttnLayers == 0, per head as well when TraceAttnHeads is set.
++var (
++	TraceLayerStride = Uint("OLLAMA_TRACE_LAYER_STRIDE", 4)
++	TraceAttnLayers  = Uint("OLLAMA_TRACE_ATTN_LAYERS", 4)
++	TraceAttnHeads   = Bool("OLLAMA_TRACE_ATTN_HEADS")
++)
++
+ func Remotes() []string {
+ 	var r []string
+ 	raw := strings.TrimSpace(Var("OLLAMA_REMOTES"))
+@@ -370,6 +380,9 @@ func AsMap() map[string]EnvVar {
+ 		"OLLAMA_TRACE_DETAIL":         {"OLLAMA_TRACE_DETAIL", TraceDetail(), "Default trace detail level: basic, layers or full (default basic)"},
+ 		"OLLAMA_TRACE_STEP":           {"OLLAMA_TRACE_STEP", TraceStep(), "Trace step mode for every request (token)"},
+ 		"OLLAMA_TRACE_STEP_TIMEOUT":   {"OLLAMA_TRACE_STEP_TIMEOUT", TraceStepTimeout(), "How long a step-mode request waits for an ack (default \"60s\")"},
++		"OLLAMA_TRACE_LAYER_STRIDE":   {"OLLAMA_TRACE_LAYER_STRIDE", TraceLayerStride(), "Trace layer events on every Nth decode step after the first 8 (default 4)"},
++		"OLLAMA_TRACE_ATTN_LAYERS":    {"OLLAMA_TRACE_ATTN_LAYERS", TraceAttnLayers(), "Trace attention on every Nth layer (default 4)"},
++		"OLLAMA_TRACE_ATTN_HEADS":     {"OLLAMA_TRACE_ATTN_HEADS", TraceAttnHeads(), "Also trace attention per head"},
+ 
+ 		// Informational
+ 		"HTTP_PROXY":  {"HTTP_PROXY", String("HTTP_PROXY")(), "HTTP proxy"},
+-- 
+2.47.1.windows.2
+

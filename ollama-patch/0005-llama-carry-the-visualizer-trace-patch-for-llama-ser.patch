@@ -1,0 +1,1712 @@
+From 74bfad40e28d228ee757a098fb6cce90baac812f Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 16:15:38 -0700
+Subject: [PATCH 05/10] llama: carry the visualizer trace patch for
+ llama-server
+
+Squashed llama.cpp change (b11963..visualizer-trace) that makes
+llama-server emit layer, op, attention, residual, KV-write, prefill
+ubatch and sampler-stage trace events for requests with a "trace"
+object, plus POST /trace/ack for layer/sample step mode.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ llama/compat/100-visualizer-trace.patch | 1686 +++++++++++++++++++++++
+ 1 file changed, 1686 insertions(+)
+ create mode 100644 llama/compat/100-visualizer-trace.patch
+
+diff --git a/llama/compat/100-visualizer-trace.patch b/llama/compat/100-visualizer-trace.patch
+new file mode 100644
+index 00000000..e3990aa4
+--- /dev/null
++++ b/llama/compat/100-visualizer-trace.patch
+@@ -0,0 +1,1686 @@
++visualizer-trace: llama.cpp b11963..visualizer-trace (5cdcbf45d) squashed for ollama/llama/compat
++(apply-git-patches.cmake reverse-checks each patch, so the series must be one patch)
++
++ common/sampling.cpp             |  52 ++-
++ common/sampling.h               |  12 +
++ include/llama.h                 |   5 +
++ src/llama-context.cpp           |  13 +
++ src/llama-context.h             |   1 +
++ tools/server/CMakeLists.txt     |   2 +
++ tools/server/server-context.cpp |  71 +++
++ tools/server/server-queue.cpp   |   6 +
++ tools/server/server-queue.h     |   3 +
++ tools/server/server-schema.cpp  |   7 +
++ tools/server/server-task.cpp    |  33 +-
++ tools/server/server-task.h      |   7 +
++ tools/server/server-trace.cpp   | 984 ++++++++++++++++++++++++++++++++++++++++
++ tools/server/server-trace.h     | 147 ++++++
++ tools/server/server.cpp         |  18 +
++ 15 files changed, 1358 insertions(+), 3 deletions(-)
++
++diff --git a/common/sampling.cpp b/common/sampling.cpp
++index 564fa9c4d..37de4d614 100644
++--- a/common/sampling.cpp
+++++ b/common/sampling.cpp
++@@ -125,6 +125,35 @@ struct common_sampler {
++     // for rejection sampling; independent of the draft, or the target distribution is not preserved
++     std::mt19937 rng;
++ 
+++    // [visualizer-trace] stage observer, see common_sampler_set_stage_cb()
+++    common_sampler_stage_cb stage_cb    = nullptr;
+++    void *                  stage_cb_ud = nullptr;
+++
+++    void stage(const char * name, bool pre = false, llama_sampler * smpl = nullptr) const {
+++        if (stage_cb) {
+++            stage_cb(smpl, name, &cur_p, pre, stage_cb_ud);
+++        }
+++    }
+++
+++    // llama_sampler_apply(chain, &cur_p), one sampler at a time when observed
+++    void apply_chain() {
+++        if (!stage_cb || params.backend_sampling) {
+++            llama_sampler_apply(chain, &cur_p);
+++            return;
+++        }
+++        const int32_t n = llama_sampler_chain_n(chain);
+++        for (int32_t i = 0; i < n; ++i) {
+++            llama_sampler * s = llama_sampler_chain_get(chain, i);
+++            if (s->iface->apply == nullptr) {
+++                continue;
+++            }
+++            const char * name = llama_sampler_name(s);
+++            stage(name, true, s);
+++            llama_sampler_apply(s, &cur_p);
+++            stage(name, false, s);
+++        }
+++    }
+++
++     void reset() {
++         prev.clear();
++ 
++@@ -595,6 +624,13 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
++     }
++ }
++ 
+++void common_sampler_set_stage_cb(struct common_sampler * gsmpl, common_sampler_stage_cb cb, void * user_data) {
+++    if (gsmpl) {
+++        gsmpl->stage_cb    = cb;
+++        gsmpl->stage_cb_ud = user_data;
+++    }
+++}
+++
++ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
++     if (!gsmpl) {
++         return nullptr;
++@@ -640,14 +676,20 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
++         }
++     }
++ 
+++    gsmpl->stage("raw"); // [visualizer-trace]
+++
++     // apply reasoning budget first
++     llama_sampler_apply(rbudget, &cur_p);
+++    if (rbudget) {
+++        gsmpl->stage("reasoning_budget");
+++    }
++ 
++     if (grammar_first && grammar_should_apply(gsmpl)) {
++         llama_sampler_apply(grmr, &cur_p);
+++        gsmpl->stage("grammar");
++     }
++ 
++-    llama_sampler_apply(chain, &cur_p);
+++    gsmpl->apply_chain();
++ 
++     id = cur_p.data[cur_p.selected].id;
++ 
++@@ -672,13 +714,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
++     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
++     gsmpl->set_logits(ctx, idx);
++ 
+++    gsmpl->stage("raw"); // [visualizer-trace] a second "raw" restarts the stage list
+++
++     llama_sampler_apply(rbudget,  &cur_p);
+++    if (rbudget) {
+++        gsmpl->stage("reasoning_budget");
+++    }
++ 
++     if (grammar_should_apply(gsmpl)) {
++         llama_sampler_apply(grmr,  &cur_p);
+++        gsmpl->stage("grammar");
++     }
++ 
++-    llama_sampler_apply(chain, &cur_p);
+++    gsmpl->apply_chain();
++ 
++     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
++ 
++diff --git a/common/sampling.h b/common/sampling.h
++index f19bd27c4..ee9314d62 100644
++--- a/common/sampling.h
+++++ b/common/sampling.h
++@@ -55,6 +55,18 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
++ // get the underlying llama_sampler_chain
++ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
++ 
+++// [visualizer-trace] optional per-stage observer for common_sampler_sample()
+++//
+++// When set, common_sampler_sample() applies the chain one sampler at a time and calls the observer
+++// with pre == true right before and pre == false right after each sampler, plus once with
+++// smpl == nullptr for the "raw" logits and for the "reasoning_budget" / "grammar" stages.
+++// stage is the llama.cpp sampler name (llama_sampler_name()). The observer must not modify cur_p.
+++// Has no effect with backend sampling. Pass cb == nullptr to remove.
+++typedef void (*common_sampler_stage_cb)(
+++        struct llama_sampler * smpl, const char * stage, const llama_token_data_array * cur_p, bool pre, void * user_data);
+++
+++void common_sampler_set_stage_cb(struct common_sampler * gsmpl, common_sampler_stage_cb cb, void * user_data);
+++
++ // extended sampling implementation:
++ //
++ // - set logits
++diff --git a/include/llama.h b/include/llama.h
++index ae54e661b..0ab421b1d 100644
++--- a/include/llama.h
+++++ b/include/llama.h
++@@ -1127,6 +1127,11 @@ extern "C" {
++     // Set abort callback
++     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
++ 
+++    // [visualizer-trace] Install (or remove, with cb_eval == NULL) the scheduler eval callback at runtime,
+++    // overriding llama_context_params.cb_eval. Takes effect on the next graph compute, including reused
+++    // graphs. With no callback installed the scheduler computes each split in a single call.
+++    LLAMA_API void llama_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data);
+++
++     // Wait until all computations are finished
++     // This is automatically done when using one of the functions below to obtain the computation results
++     // and is not necessary to call it explicitly in most cases
++diff --git a/src/llama-context.cpp b/src/llama-context.cpp
++index 33ad7845f..5bff79db0 100644
++--- a/src/llama-context.cpp
+++++ b/src/llama-context.cpp
++@@ -1320,6 +1320,15 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
++     cparams.n_threads_batch = n_threads_batch;
++ }
++ 
+++// [visualizer-trace] runtime eval callback. process_ubatch() re-applies cparams.cb_eval whenever it
+++// rebuilds a graph, and the scheduler keeps the callback across reused graphs, so set both.
+++void llama_context::set_eval_callback(ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) {
+++    cparams.cb_eval           = cb_eval;
+++    cparams.cb_eval_user_data = cb_eval_user_data;
+++
+++    ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
+++}
+++
++ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
++     LLAMA_LOG_DEBUG("%s: call\n", __func__);
++ 
++@@ -4218,6 +4227,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
++     ctx->set_abort_callback(abort_callback, abort_callback_data);
++ }
++ 
+++void llama_set_eval_callback(llama_context * ctx, ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) {
+++    ctx->set_eval_callback(cb_eval, cb_eval_user_data);
+++}
+++
++ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
++     ctx->set_embeddings(embeddings);
++ }
++diff --git a/src/llama-context.h b/src/llama-context.h
++index 6938fb103..988f5e95a 100644
++--- a/src/llama-context.h
+++++ b/src/llama-context.h
++@@ -116,6 +116,7 @@ struct llama_context {
++     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
++ 
++     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+++    void set_eval_callback(ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data); // [visualizer-trace]
++ 
++     void set_embeddings (bool value);
++     void set_embeddings_nextn(bool value, bool masked);
++diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
++index 4f3fa2458..979f2e6a5 100644
++--- a/tools/server/CMakeLists.txt
+++++ b/tools/server/CMakeLists.txt
++@@ -27,6 +27,8 @@ add_library(${TARGET} STATIC
++     server-mcp.h
++     server-schema.cpp
++     server-schema.h
+++    server-trace.cpp
+++    server-trace.h
++ )
++ 
++ if (BUILD_SHARED_LIBS)
++diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
++index 2bd1ab9ec..678ea7979 100644
++--- a/tools/server/server-context.cpp
+++++ b/tools/server/server-context.cpp
++@@ -391,6 +391,8 @@ struct server_slot {
++ 
++     common_sampler_ptr smpl;
++ 
+++    server_trace trace; // [visualizer-trace] per-request collector, active() only for traced requests
+++
++     llama_token sampled; // in speculative mode, this is the last accepted token
++ 
++     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
++@@ -529,6 +531,12 @@ struct server_slot {
++     bool can_batch_with(server_slot & other_slot) const {
++         GGML_ASSERT(task);
++ 
+++        // [visualizer-trace] a traced request always runs in a batch of its own, so the eval callback
+++        // only ever sees its tokens
+++        if (&other_slot != this && (trace.active() || other_slot.trace.active())) {
+++            return false;
+++        }
+++
++         // a joint decision head reads the whole batch
++         if (!task->decision.order.empty() || !other_slot.task->decision.order.empty()) {
++             return false;
++@@ -676,6 +684,8 @@ struct server_slot {
++ 
++             callback_on_reset(*this);
++ 
+++            trace.stop(); // [visualizer-trace]
+++
++             reset();
++ 
++             callback_on_release(id);
++@@ -2097,6 +2107,11 @@ private:
++ 
++         slot.task = std::make_unique<const server_task>(std::move(task));
++ 
+++        // [visualizer-trace] per-request collector; in stream mode, step mode flushes events with trace-only chunks
+++        slot.trace.start(slot.task->params.trace, slot.id, ctx_tgt, slot.task->params.stream
+++            ? std::function<void()>([this, &slot]() { send_trace_chunk(slot); }) : std::function<void()>(),
+++            [this, id_task = slot.task->id]() { return queue_results.is_waiting(id_task); });
+++
++         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
++             slot.state = SLOT_STATE_PROCESSING_PROMPT;
++         } else {
++@@ -2345,12 +2360,38 @@ private:
++         queue_results.send(std::move(res));
++     }
++ 
+++    // [visualizer-trace] stream chunk with no content, only the pending trace events (step mode)
+++    void send_trace_chunk(server_slot & slot) {
+++        auto res = std::make_unique<server_task_result_cmpl_partial>();
+++
+++        res->id            = slot.task->id;
+++        res->index         = slot.task->index;
+++        res->is_trace_only = true;
+++        res->trace         = slot.trace.take();
+++
+++        res->n_decoded             = slot.stats.n_gen;
+++        res->n_prompt_tokens       = slot.task->n_tokens();
+++        res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
+++        res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+++
+++        res->verbose           = false;
+++        res->res_type          = slot.task->params.res_type;
+++        res->oaicompat_model   = slot.task->params.oaicompat_model;
+++        res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+++
+++        queue_results.send(std::move(res));
+++    }
+++
++     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
++         auto res = std::make_unique<server_task_result_cmpl_partial>();
++ 
++         res->id    = slot.task->id;
++         res->index = slot.task->index;
++ 
+++        if (!is_begin && slot.trace.active()) {
+++            res->trace = slot.trace.take(); // [visualizer-trace]
+++        }
+++
++         if (is_progress) {
++             res->is_progress        = true;
++             res->progress.total     = slot.task->n_tokens();
++@@ -2406,6 +2447,10 @@ private:
++         res->id      = slot.task->id;
++         res->id_slot = slot.id;
++ 
+++        if (slot.trace.active()) {
+++            res->trace = slot.trace.take(); // [visualizer-trace]
+++        }
+++
++         res->index = slot.task->index;
++ 
++         // keep copy of last generated text for debugging purposes
++@@ -4689,6 +4734,16 @@ private:
++         // yield to the queue, so we can still handle metrics tasks while decoding
++         // note: the sync is done here too, so that the wait is also covered by the yield
++         int ret = 0;
+++
+++        // [visualizer-trace] a traced slot is always alone in its batch (see can_batch_with), install
+++        // the eval callback for this pass only
+++        server_slot * slot_traced = batch.slot_batched && batch.slot_batched->trace.active() && !batch.view.tokens.empty()
+++            ? batch.slot_batched : nullptr;
+++        if (slot_traced) {
+++            slot_traced->trace.before_decode(ctx_tgt, slot_traced->state != SLOT_STATE_GENERATING, slot_traced->stats.n_gen + 1,
+++                    batch.view.tokens.front().pos[0], batch.view.tokens.back().pos[0], (int32_t) batch.view.tokens.size());
+++        }
+++
++         queue_tasks.yield_to_queue([&]() {
++             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
++             if (ret == 0 && has_output) {
++@@ -4696,6 +4751,10 @@ private:
++             }
++         });
++ 
+++        if (slot_traced) {
+++            slot_traced->trace.after_decode(ctx_tgt);
+++        }
+++
++         if (ret != 0) {
++             {
++                 std::string err;
++@@ -4856,6 +4915,10 @@ private:
++                 // prompt evaluated for next-token prediction
++                 slot.state = SLOT_STATE_GENERATING;
++ 
+++                if (slot.trace.active()) {
+++                    slot.trace.prefill_done(); // [visualizer-trace]
+++                }
+++
++                 if (slot.can_speculate()) {
++                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
++                 }
++@@ -4873,7 +4936,15 @@ private:
++             llama_token id;
++             {
++                 scoped_timer timer(t_sampl, n_sampl);
+++                // [visualizer-trace] snapshot the sampler chain stage by stage (full detail)
+++                const bool traced = slot.trace.active();
+++                if (traced) {
+++                    slot.trace.sample_begin(slot.smpl.get(), slot.stats.n_gen + 1);
+++                }
++                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+++                if (traced) {
+++                    slot.trace.sample_end(slot.smpl.get(), id, slot.task->params.sampling);
+++                }
++             }
++ 
++             slot.i_batch = -1;
++diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
++index c4ce90721..1cc60a339 100644
++--- a/tools/server/server-queue.cpp
+++++ b/tools/server/server-queue.cpp
++@@ -620,3 +620,9 @@ void server_response_reader::stop() {
++         SRV_DBG("%s", "all tasks already finished, no need to cancel\n");
++     }
++ }
+++
+++// [visualizer-trace]
+++bool server_response::is_waiting(int id_task) {
+++    std::unique_lock<std::mutex> lock(mutex_results);
+++    return waiting_task_ids.count(id_task) > 0;
+++}
++diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
++index 692255e4f..34e7db119 100644
++--- a/tools/server/server-queue.h
+++++ b/tools/server/server-queue.h
++@@ -176,6 +176,9 @@ public:
++     // remove multiple tasks from waiting list
++     void remove_waiting_task_ids(const std::unordered_set<int> & id_tasks);
++ 
+++    // [visualizer-trace] whether a client still waits for results of id_task
+++    bool is_waiting(int id_task);
+++
++     // This function blocks the thread until there is a response for one of the id_tasks
++     server_task_result_ptr recv(const std::unordered_set<int> & id_tasks);
++ 
++diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
++index 0a14a9620..774c64507 100644
++--- a/tools/server/server-schema.cpp
+++++ b/tools/server/server-schema.cpp
++@@ -22,6 +22,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
++     add((new field_bool("timings_per_token", params.timings_per_token))
++         ->set_desc("Include prompt processing and text generation speed information in each response"));
++ 
+++    // [visualizer-trace]
+++    add((new field_json("trace"))
+++        ->set_desc("Inference tracing for the visualizer: {detail, layer_stride, attn_layers, attn_topk, attn_heads, sample_topn, step, step_timeout_ms}. Events ride on the response chunks as __trace")
+++        ->set_handler([&](field_eval_context & ctx, const json & data) {
+++            ctx.params.trace = server_trace_params::from_json(data.at("trace"));
+++        }));
+++
++     add((new field_bool("stream", params.stream))
++         ->set_desc("Allows receiving each predicted token in real-time instead of waiting for the completion to finish"));
++ 
++diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
++index 1a0d434a1..13cfc8487 100644
++--- a/tools/server/server-task.cpp
+++++ b/tools/server/server-task.cpp
++@@ -311,6 +311,14 @@ std::vector<unsigned char> completion_token_output::str_to_bytes(const std::stri
++ //
++ json server_task_result_cmpl_final::to_json() {
++     GGML_ASSERT(is_updated && "update() must be called before to_json()");
+++    // [visualizer-trace] remaining trace events ride on the final chunk
+++    if (!trace.empty() && (res_type == TASK_RESPONSE_TYPE_NONE || res_type == TASK_RESPONSE_TYPE_OAI_CMPL || res_type == TASK_RESPONSE_TYPE_OAI_CHAT)) {
+++        json res = res_type == TASK_RESPONSE_TYPE_NONE     ? to_json_non_oaicompat()
+++                 : res_type == TASK_RESPONSE_TYPE_OAI_CMPL ? to_json_oaicompat()
+++                 : stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat();
+++        trace.attach(res);
+++        return res;
+++    }
++     switch (res_type) {
++         case TASK_RESPONSE_TYPE_NONE:
++             return to_json_non_oaicompat();
++@@ -990,7 +998,7 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
++ //
++ void server_task_result_cmpl_partial::update(task_result_state & state) {
++     is_updated = true;
++-    if (is_begin) {
+++    if (is_begin || is_trace_only) {
++         return; // begin marker only flushes headers, skip parsing
++     }
++     state.update_chat_msg(content, true, oaicompat_msg_diffs);
++@@ -1031,6 +1039,29 @@ json server_task_result_cmpl_partial::to_json() {
++     if (is_begin) {
++         return nullptr; // simply signal to HTTP handler to send the headers and status code
++     }
+++    // [visualizer-trace] attach the events of this token (and a trace-only chunk in step mode)
+++    if (!trace.empty() || is_trace_only) {
+++        json res;
+++        if (is_trace_only && res_type == TASK_RESPONSE_TYPE_OAI_CHAT) {
+++            res = json {
+++                {"choices", json::array()},
+++                {"created", std::time(0)},
+++                {"id",      oaicompat_cmpl_id},
+++                {"model",   oaicompat_model},
+++                {"object",  "chat.completion.chunk"},
+++            };
+++        } else if (res_type == TASK_RESPONSE_TYPE_NONE) {
+++            res = to_json_non_oaicompat();
+++        } else if (res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
+++            res = to_json_oaicompat();
+++        } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT) {
+++            res = to_json_oaicompat_chat();
+++        }
+++        if (!res.is_null()) {
+++            trace.attach(res);
+++            return res;
+++        }
+++    }
++     switch (res_type) {
++         case TASK_RESPONSE_TYPE_NONE:
++             return to_json_non_oaicompat();
++diff --git a/tools/server/server-task.h b/tools/server/server-task.h
++index 21b649ac4..1b6bb158b 100644
++--- a/tools/server/server-task.h
+++++ b/tools/server/server-task.h
++@@ -11,6 +11,7 @@
++ // TODO: prevent including the whole server-common.h as we only use server_tokens
++ #include "server-common.h"
++ #include "mtmd-helper.h"
+++#include "server-trace.h" // [visualizer-trace]
++ 
++ 
++ enum server_task_type {
++@@ -100,6 +101,8 @@ struct task_params {
++     bool timings_per_token   = false;
++     bool post_sampling_probs = false;
++ 
+++    server_trace_params trace; // [visualizer-trace] "trace" request field
+++
++     struct common_params_sampling sampling;
++     struct common_params_speculative speculative;
++ 
++@@ -407,6 +410,8 @@ struct server_task_result_cmpl_final : server_task_result {
++     common_chat_input content;
++     llama_tokens tokens;
++ 
+++    server_trace_payload trace; // [visualizer-trace] events not yet sent
+++
++     bool stream;
++     bool include_usage;
++     server_slot_stats stats;
++@@ -488,6 +493,8 @@ struct server_task_result_cmpl_partial : server_task_result {
++ 
++     bool post_sampling_probs;
++     bool is_progress = false;
+++    bool is_trace_only = false;  // [visualizer-trace] chunk that only carries trace events (step mode)
+++    server_trace_payload trace;  // [visualizer-trace]
++     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
++                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884
++     bool audio_commit_drained = false; // realtime: non-final commit has fully decoded
++diff --git a/tools/server/server-trace.cpp b/tools/server/server-trace.cpp
++new file mode 100644
++index 000000000..d6c204c6b
++--- /dev/null
+++++ b/tools/server/server-trace.cpp
++@@ -0,0 +1,984 @@
+++// [visualizer-trace] see server-trace.h
+++
+++#include "server-trace.h"
+++
+++#include "ggml.h"
+++#include "ggml-backend.h"
+++
+++#include <algorithm>
+++#include <chrono>
+++#include <cmath>
+++#include <condition_variable>
+++#include <cstring>
+++#include <queue>
+++#include <stdexcept>
+++
+++//
+++// helpers
+++//
+++
+++static int64_t trace_now_ns() {
+++    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+++}
+++
+++static double ns_to_ms(int64_t ns) {
+++    return ns > 0 ? std::round((double) ns / 1e2) / 1e4 : 0.0; // ms, 0.1 us resolution
+++}
+++
+++static json trace_ev(const char * type) {
+++    return json{{"type", type}, {"t_ns", trace_now_ns()}};
+++}
+++
+++// "Qcur-12" -> base "Qcur", il 12. Names with any other suffix (views such as "Qcur-12 (reshaped)",
+++// scheduler copies such as "CUDA0#Qcur-12#0") return false. Names without "-<il>" give il = -1.
+++static bool trace_parse_name(const char * name, char * base, size_t base_size, int & il) {
+++    if (strchr(name, '#') || strchr(name, ' ')) {
+++        return false;
+++    }
+++    const char * dash = strrchr(name, '-');
+++    il = -1;
+++    size_t n = strlen(name);
+++    if (dash && dash[1] != '\0') {
+++        bool digits = true;
+++        for (const char * c = dash + 1; *c; ++c) {
+++            digits &= (*c >= '0' && *c <= '9');
+++        }
+++        if (digits) {
+++            il = atoi(dash + 1);
+++            n  = (size_t) (dash - name);
+++        }
+++    }
+++    if (n + 1 > base_size) {
+++        return false;
+++    }
+++    memcpy(base, name, n);
+++    base[n] = '\0';
+++    return true;
+++}
+++
+++// op enum of the trace schema; the segment of the graph that ends at a node is charged to its op
+++enum { OP_NORM, OP_QKV, OP_SCORES, OP_ATTN_OUT, OP_MLP_UP, OP_MLP_ACT, OP_MLP_DOWN, OP_COUNT };
+++static const char * OP_NAMES[OP_COUNT] = { "norm", "attn_qkv", "attn_scores", "attn_out", "mlp_up", "mlp_act", "mlp_down" };
+++
+++static int trace_op_of(const ggml_tensor * t, const char * b) {
+++    if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+++        return OP_SCORES;
+++    }
+++    static const struct { const char * name; int op; } map[] = {
+++        { "attn_norm",       OP_NORM     }, { "ffn_norm",        OP_NORM     },
+++        { "Qcur",            OP_QKV      }, { "Kcur",            OP_QKV      }, { "Vcur", OP_QKV },
+++        { "kq_soft_max",     OP_SCORES   },
+++        { "kqv_out",         OP_ATTN_OUT }, { "attn_out",        OP_ATTN_OUT }, // attn_out: output projection (wo)
+++        { "ffn_up",          OP_MLP_UP   }, { "ffn_gate",        OP_MLP_UP   },
+++        { "ffn_moe_up",      OP_MLP_UP   }, { "ffn_moe_gate",    OP_MLP_UP   }, { "ffn_moe_gate_up", OP_MLP_UP },
+++        { "ffn_silu",        OP_MLP_ACT  }, { "ffn_gelu",        OP_MLP_ACT  }, { "ffn_swiglu",  OP_MLP_ACT },
+++        { "ffn_geglu",       OP_MLP_ACT  }, { "ffn_act",         OP_MLP_ACT  }, { "ffn_relu",    OP_MLP_ACT },
+++        { "ffn_reglu",       OP_MLP_ACT  }, { "ffn_gelu_erf",    OP_MLP_ACT  }, { "ffn_geglu_erf", OP_MLP_ACT },
+++        { "ffn_moe_silu",    OP_MLP_ACT  }, { "ffn_moe_swiglu",  OP_MLP_ACT  }, { "ffn_moe_gelu", OP_MLP_ACT },
+++        { "ffn_moe_geglu",   OP_MLP_ACT  },
+++        { "ffn_down",        OP_MLP_DOWN }, { "ffn_moe_down",    OP_MLP_DOWN },
+++        { "ffn_out",         OP_MLP_DOWN }, // models rename the ffn_down output to ffn_out (and the residual add too)
+++    };
+++    for (const auto & m : map) {
+++        if (strcmp(b, m.name) == 0) {
+++            return m.op;
+++        }
+++    }
+++    return -1;
+++}
+++
+++static bool trace_is_moe_weights(const char * b) {
+++    return strcmp(b, "ffn_moe_weights") == 0 || strcmp(b, "ffn_moe_weights_softmax") == 0 ||
+++           strcmp(b, "ffn_moe_weights_norm") == 0 || strcmp(b, "ffn_moe_weights_scaled") == 0;
+++}
+++
+++static const char * trace_device(const ggml_tensor * t) {
+++    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+++    if (!buf) {
+++        return "CPU";
+++    }
+++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+++    return dev ? ggml_backend_dev_name(dev) : "CPU";
+++}
+++
+++// row i1 (dim 1) of a tensor with contiguous rows, converted to f32; host = the whole tensor span
+++// already copied with trace_read_all() (one transfer for many rows), or nullptr to read the row
+++static bool trace_read_row(const ggml_tensor * t, int64_t i1, int64_t i2, std::vector<float> & out, const uint8_t * host = nullptr) {
+++    const int64_t n = t->ne[0];
+++    const size_t  rs = ggml_row_size(t->type, n);
+++    const size_t  off = i1*t->nb[1] + i2*t->nb[2];
+++    if (t->nb[0] != ggml_type_size(t->type) || off + rs > ggml_nbytes(t)) {
+++        return false;
+++    }
+++    out.resize(n);
+++    const auto * tt = ggml_get_type_traits(t->type);
+++    if (t->type != GGML_TYPE_F32 && !tt->to_float) {
+++        return false;
+++    }
+++    std::vector<uint8_t> tmp;
+++    const uint8_t * src = host ? host + off : nullptr;
+++    if (!src) {
+++        tmp.resize(rs);
+++        ggml_backend_tensor_get(t, tmp.data(), off, rs);
+++        src = tmp.data();
+++    }
+++    if (t->type == GGML_TYPE_F32) {
+++        memcpy(out.data(), src, rs);
+++    } else {
+++        tt->to_float(src, out.data(), n);
+++    }
+++    return true;
+++}
+++
+++static void trace_read_all(const ggml_tensor * t, std::vector<uint8_t> & buf) {
+++    buf.resize(ggml_nbytes(t));
+++    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+++}
+++
+++// no-op view nodes: observing them only adds a sync, their (zero) time merges into the next segment
+++static bool trace_is_view(const ggml_tensor * t) {
+++    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+++}
+++
+++static float trace_l2(const float * a, const float * b, size_t n) {
+++    double s = 0.0;
+++    for (size_t i = 0; i < n; ++i) {
+++        const double d = b ? (double) a[i] - b[i] : (double) a[i];
+++        s += d*d;
+++    }
+++    return (float) std::sqrt(s);
+++}
+++
+++// top-n candidates by value (logit, or p after the distribution sampler); skips -inf
+++static json trace_top_candidates(const llama_token_data_array * cur_p, int n, bool use_p, int32_t & n_alive) {
+++    n_alive = 0;
+++    auto val = [&](const llama_token_data & d) { return use_p ? d.p : d.logit; };
+++    using item = std::pair<float, int32_t>; // value, index
+++    std::priority_queue<item, std::vector<item>, std::greater<item>> heap; // min-heap of the best n
+++    // hot loop over the full vocab for the raw stage: keep the admission threshold in a local
+++    float thr = -INFINITY;
+++    for (size_t i = 0; i < cur_p->size; ++i) {
+++        const float v = val(cur_p->data[i]);
+++        if (v == -INFINITY) {
+++            continue;
+++        }
+++        n_alive++;
+++        if ((int) heap.size() < n) {
+++            heap.push({ v, (int32_t) i });
+++            if ((int) heap.size() == n) {
+++                thr = heap.top().first;
+++            }
+++        } else if (v > thr && n > 0) {
+++            heap.pop();
+++            heap.push({ v, (int32_t) i });
+++            thr = heap.top().first;
+++        }
+++    }
+++    std::vector<item> best;
+++    best.reserve(heap.size());
+++    while (!heap.empty()) {
+++        best.push_back(heap.top());
+++        heap.pop();
+++    }
+++    json res = json::array();
+++    for (auto it = best.rbegin(); it != best.rend(); ++it) {
+++        res.push_back({ { "id", cur_p->data[it->second].id }, { "v", it->first } });
+++    }
+++    return res;
+++}
+++
+++// llama.cpp sampler name -> trace stage name (schema SAMPLE_STAGES, else the llama.cpp name with '-' -> '_')
+++static std::string trace_stage_name(const char * name) {
+++    while (*name == '+' || *name == '-') {
+++        name++; // backend sampler prefix, see llama_sampler_backend::get_name()
+++    }
+++    static const struct { const char * from; const char * to; } map[] = {
+++        { "penalties", "rep_penalty" }, { "temp",  "temperature" }, { "temp-ext", "temperature" },
+++        { "top-k",     "top_k"       }, { "top-p", "top_p"       }, { "min-p",    "min_p"       },
+++        { "typical",   "typical_p"   }, { "top-n-sigma", "top_n_sigma" },
+++    };
+++    for (const auto & m : map) {
+++        if (strcmp(name, m.from) == 0) {
+++            return m.to;
+++        }
+++    }
+++    std::string s = name;
+++    std::replace(s.begin(), s.end(), '-', '_');
+++    return s;
+++}
+++
+++//
+++// step gate: one request in step mode at a time, acked through POST /trace/ack
+++//
+++
+++static struct {
+++    std::mutex              m;
+++    std::condition_variable cv;
+++    int32_t     owner   = -1;  // slot id in step mode
+++    int64_t     acks    = 0;   // pending acks (semaphore: an early ack is not lost)
+++    bool        cont    = false;
+++    bool        waiting = false;
+++    std::string at_granularity;
+++    int32_t     at_step  = 0;
+++    int32_t     at_layer = -1;
+++    std::string at_stage;
+++} g_step;
+++
+++json server_trace_ack(const json & body) {
+++    const int32_t id_slot = json_value(body, "id_slot", -1);
+++    const bool    cont    = json_value(body, "continue", false);
+++
+++    std::unique_lock<std::mutex> lock(g_step.m);
+++    if (g_step.owner < 0) {
+++        return json{{"ok", false}, {"error", "no request in step mode"}};
+++    }
+++    if (id_slot >= 0 && id_slot != g_step.owner) {
+++        return json{{"ok", false}, {"error", "slot is not in step mode"}, {"id_slot", g_step.owner}};
+++    }
+++    json res = {
+++        {"ok", true},
+++        {"id_slot", g_step.owner},
+++        {"waiting", g_step.waiting},
+++    };
+++    if (g_step.waiting) {
+++        res["at"] = json{{"granularity", g_step.at_granularity}, {"step", g_step.at_step}};
+++        if (g_step.at_layer >= 0) {
+++            res["at"]["layer"] = g_step.at_layer;
+++        }
+++        if (!g_step.at_stage.empty()) {
+++            res["at"]["stage"] = g_step.at_stage;
+++        }
+++    }
+++    if (cont) {
+++        g_step.cont = true;
+++    } else {
+++        g_step.acks++;
+++    }
+++    lock.unlock();
+++    g_step.cv.notify_all();
+++    return res;
+++}
+++
+++//
+++// params / payload
+++//
+++
+++server_trace_params server_trace_params::from_json(const json & j) {
+++    server_trace_params p;
+++    if (j.is_null()) {
+++        return p;
+++    }
+++    if (!j.is_object()) {
+++        throw std::invalid_argument("must be an object");
+++    }
+++    const std::string detail = json_value(j, "detail", std::string("layers"));
+++    if      (detail == "layers") p.detail = SERVER_TRACE_LAYERS;
+++    else if (detail == "full")   p.detail = SERVER_TRACE_FULL;
+++    else if (detail == "off" || detail == "basic") p.detail = SERVER_TRACE_OFF;
+++    else throw std::invalid_argument("detail must be \"layers\" or \"full\"");
+++
+++    p.layer_stride    = std::max(1, json_value(j, "layer_stride",    p.layer_stride));
+++    p.attn_layers     = std::max(1, json_value(j, "attn_layers",     p.attn_layers));
+++    p.attn_topk       = std::clamp(json_value(j, "attn_topk",        p.attn_topk),   1, 256);
+++    p.attn_heads      =             json_value(j, "attn_heads",      p.attn_heads);
+++    p.sample_topn     = std::clamp(json_value(j, "sample_topn",      p.sample_topn), 1, 1024);
+++    p.step_timeout_ms = std::max(0, json_value(j, "step_timeout_ms", p.step_timeout_ms));
+++
+++    const std::string step = (j.contains("step") && j.at("step").is_string()) ? j.at("step").get<std::string>() : "";
+++    if      (step.empty())     p.step = SERVER_TRACE_STEP_NONE;
+++    else if (step == "layer")  p.step = SERVER_TRACE_STEP_LAYER;
+++    else if (step == "sample") p.step = SERVER_TRACE_STEP_SAMPLE;
+++    else if (step == "token")  p.step = SERVER_TRACE_STEP_NONE; // token granularity is handled by the client
+++    else throw std::invalid_argument("step must be null, \"layer\" or \"sample\"");
+++    return p;
+++}
+++
+++void server_trace_payload::attach(json & res) const {
+++    if (empty()) {
+++        return;
+++    }
+++    json * dst = &res;
+++    if (res.is_array()) {
+++        if (res.empty()) {
+++            res.push_back(json{{"object", "chat.completion.chunk"}, {"choices", json::array()}});
+++        }
+++        dst = &res.back();
+++    }
+++    if (!dst->is_object()) {
+++        return;
+++    }
+++    (*dst)["__trace"]      = events.is_null() ? json::array() : events;
+++    (*dst)["__trace_t_ns"] = t_ns;
+++    if (!caps.is_null()) {
+++        (*dst)["__trace_caps"] = caps;
+++        (*dst)["__trace_slot"] = id_slot;
+++    }
+++}
+++
+++//
+++// lifecycle
+++//
+++
+++static server_trace * g_installed = nullptr; // collector the eval callback currently points to
+++
+++void server_trace::start(const server_trace_params & params, int32_t id_slot, llama_context * ctx, std::function<void()> flush_fn, std::function<bool()> alive_fn) {
+++    stop();
+++    p = params;
+++    if (!p.enabled()) {
+++        return;
+++    }
+++    this->id_slot  = id_slot;
+++    this->flush_fn = std::move(flush_fn);
+++    this->alive_fn = std::move(alive_fn);
+++    n_layer = llama_model_n_layer(llama_get_model(ctx));
+++    {
+++        events    = json::array();
+++        caps_sent = false;
+++    }
+++    attn = ATTN_NONE;
+++    ub_i = -1;
+++    prefill_n = 0;
+++    t_prefill = 0;
+++    prefill_batches.clear();
+++    no_stages = false;
+++    step_busy = false;
+++    step_own  = false;
+++    if (p.step != SERVER_TRACE_STEP_NONE) {
+++        std::lock_guard<std::mutex> lock(g_step.m);
+++        if (g_step.owner < 0) {
+++            g_step.owner = id_slot;
+++            g_step.acks  = 0;
+++            g_step.cont  = false;
+++            step_own = true;
+++        } else {
+++            step_busy = true;
+++            p.step = SERVER_TRACE_STEP_NONE;
+++        }
+++    }
+++}
+++
+++void server_trace::stop() {
+++    if (step_own) {
+++        {
+++            std::lock_guard<std::mutex> lock(g_step.m);
+++            g_step.owner   = -1;
+++            g_step.waiting = false;
+++        }
+++        g_step.cv.notify_all();
+++        step_own = false;
+++    }
+++    p = server_trace_params();
+++    flush_fn = nullptr;
+++    alive_fn = nullptr;
+++}
+++
+++void server_trace::emit(json && ev) {
+++    events.push_back(std::move(ev));
+++}
+++
+++server_trace_payload server_trace::take() {
+++    server_trace_payload res;
+++    if (!events.empty()) {
+++        res.events = std::move(events);
+++        events = json::array();
+++    }
+++    if (!caps_sent) {
+++        caps_sent = true;
+++        json caps = json::array();
+++        if (p.detail == SERVER_TRACE_FULL && attn == ATTN_NONE) {
+++            caps.push_back("no_attn");
+++        }
+++        if (p.detail == SERVER_TRACE_FULL && no_stages) {
+++            caps.push_back("no_sample_stages");
+++        }
+++        if (step_busy) {
+++            caps.push_back("no_step"); // another request holds step mode
+++        }
+++        res.caps    = std::move(caps);
+++        res.id_slot = id_slot;
+++    }
+++    res.t_ns = trace_now_ns();
+++    return res;
+++}
+++
+++// flush what we have to the client and block until acked (step mode)
+++void server_trace::wait_step(const char * granularity) {
+++    if (!step_own) {
+++        return;
+++    }
+++    {
+++        std::lock_guard<std::mutex> lock(g_step.m);
+++        if (g_step.cont) {
+++            return; // the client left step mode: run freely, events ride on the token chunks again
+++        }
+++    }
+++    if (flush_fn) {
+++        flush_fn();
+++    }
+++    std::unique_lock<std::mutex> lock(g_step.m);
+++    if (g_step.cont) {
+++        return;
+++    }
+++    g_step.waiting        = true;
+++    g_step.at_granularity = granularity;
+++    g_step.at_step        = strcmp(granularity, "sample") == 0 ? sample_step : step;
+++    g_step.at_layer       = strcmp(granularity, "layer") == 0 ? cur_layer : -1;
+++    // wait in slices so a client that went away (its HTTP handler stopped waiting for results)
+++    // releases the server at once instead of after every remaining timeout
+++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(p.step_timeout_ms);
+++    bool ok = false;
+++    for (;;) {
+++        const auto left  = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+++        const auto slice = std::min(left, std::chrono::milliseconds(250));
+++        if (g_step.cv.wait_for(lock, std::max(slice, std::chrono::milliseconds(0)), [] {
+++                return g_step.acks > 0 || g_step.cont || g_step.owner < 0;
+++            })) {
+++            ok = true;
+++            break;
+++        }
+++        if (std::chrono::steady_clock::now() >= deadline) {
+++            break;
+++        }
+++        lock.unlock();
+++        const bool alive = !alive_fn || alive_fn();
+++        lock.lock();
+++        if (!alive) {
+++            g_step.cont = true; // leave step mode for the rest of this request
+++            ok = true;
+++            break;
+++        }
+++    }
+++    g_step.waiting = false;
+++    g_step.at_stage.clear();
+++    if (g_step.acks > 0) {
+++        g_step.acks--;
+++    }
+++    const int32_t at_step = g_step.at_step;
+++    lock.unlock();
+++    if (!ok) {
+++        json ev = trace_ev("step.timeout");
+++        ev["step"]        = at_step;
+++        ev["granularity"] = granularity;
+++        emit(std::move(ev));
+++    }
+++    t_last = trace_now_ns(); // do not charge the wait to the next op
+++    t_layer = t_last;
+++}
+++
+++//
+++// forward pass
+++//
+++
+++void server_trace::before_decode(llama_context * ctx, bool prefill, int32_t step, int32_t pos_first, int32_t pos_last, int32_t n_tokens) {
+++    GGML_UNUSED(n_tokens);
+++    this->prefill = prefill;
+++    this->step    = step;
+++    this->pos     = pos_last;
+++    cur_layer = -1;
+++    in_ub     = false;
+++    layer_dev = nullptr;
+++    t_last    = trace_now_ns();
+++    t_layer   = t_last;
+++    std::fill(std::begin(ops), std::end(ops), 0.0);
+++    row_prev.clear();
+++    moe_ids.clear();
+++    moe_w.clear();
+++
+++    if (prefill) {
+++        if (t_prefill == 0) {
+++            t_prefill = t_last;
+++        }
+++        pass_from = pos_first;
+++        observe   = true; // at least the last layer, for the prefill.batch boundaries
+++    } else {
+++        observe = step < 8 || step % p.layer_stride == 0 || (step_own && p.step == SERVER_TRACE_STEP_LAYER);
+++    }
+++
+++    if (observe) {
+++        llama_set_eval_callback(ctx, eval_cb, this);
+++        g_installed = this;
+++    }
+++}
+++
+++void server_trace::after_decode(llama_context * ctx) {
+++    if (g_installed) {
+++        llama_set_eval_callback(ctx, nullptr, nullptr);
+++        g_installed = nullptr;
+++    }
+++}
+++
+++void server_trace::prefill_done() {
+++    const int64_t now = trace_now_ns();
+++    const int32_t of  = (int32_t) prefill_batches.size();
+++    for (auto & ev : prefill_batches) {
+++        ev["of"] = std::max(of, 1);
+++        emit(std::move(ev));
+++    }
+++    prefill_batches.clear();
+++    json ev = trace_ev("prefill.done");
+++    ev["n_tokens"] = prefill_n;
+++    ev["ms"]       = ns_to_ms(t_prefill ? now - t_prefill : 0);
+++    emit(std::move(ev));
+++}
+++
+++bool server_trace::want(const ggml_tensor * t, const char * b, int il) const {
+++    const bool full = p.detail == SERVER_TRACE_FULL;
+++    if (strcmp(b, "l_out") == 0 && il >= 0) {
+++        return prefill ? (full || il == n_layer - 1) : true;
+++    }
+++    if (prefill || !full) {
+++        return false;
+++    }
+++    const bool is_attn = t->op == GGML_OP_FLASH_ATTN_EXT || strcmp(b, "kq_soft_max") == 0;
+++    if (is_attn) {
+++        return true; // timing; the weights are read only on every attn_layers-th layer
+++    }
+++    if (il < 0) {
+++        return strcmp(b, "embd") == 0; // layer 0 input, for its residual delta
+++    }
+++    if (strcmp(b, "ffn_moe_topk") == 0 || trace_is_moe_weights(b)) {
+++        return true; // read back (ffn_moe_topk is a view of the argsort)
+++    }
+++    // op boundaries; views (e.g. the pre-RoPE Qcur/Kcur/Vcur reshapes, kqv_out with FA) are skipped,
+++    // their segment is charged to the next observed node, which in llama-family graphs has the same op
+++    return trace_op_of(t, b) >= 0 && !trace_is_view(t);
+++}
+++
+++bool server_trace::eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+++    auto * tr = (server_trace *) user_data;
+++
+++    char base[GGML_MAX_NAME];
+++    int  il = -1;
+++    if (!trace_parse_name(t->name, base, sizeof(base), il)) {
+++        if (t->op != GGML_OP_FLASH_ATTN_EXT) {
+++            return ask ? false : true;
+++        }
+++        base[0] = '\0';
+++    }
+++    if (t->op == GGML_OP_FLASH_ATTN_EXT && il < 0) {
+++        il = tr->cur_layer; // the fused attention node is unnamed; it belongs to the layer being built
+++    }
+++
+++    if (ask) {
+++        if (il >= 0) {
+++            tr->cur_layer = il;
+++            if (il == 0 && !tr->in_ub) {
+++                // first node of a new ubatch (the scheduler asks before it computes)
+++                tr->in_ub   = true;
+++                tr->ub_i   += tr->prefill ? 1 : 0;
+++                tr->t_ub    = trace_now_ns();
+++                tr->t_last  = tr->t_ub;
+++                tr->t_layer = tr->t_ub;
+++            }
+++            if (il == 0 && strcmp(base, "l_out") == 0) {
+++                tr->ub_ntok = (int32_t) t->ne[1];
+++            }
+++        }
+++        // the layer runs where its weights are: the first weight matmul of the layer decides (the
+++        // scheduler may still put weight-less ops such as the residual add on a neighbouring GPU)
+++        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && !tr->layer_dev && tr->cur_layer >= 0 &&
+++                t->src[0] && t->src[0]->buffer && ggml_backend_buffer_get_usage(t->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+++            tr->layer_dev = trace_device(t->src[0]);
+++        }
+++        if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+++            tr->attn = ATTN_FLASH;
+++        } else if (strcmp(base, "kq_soft_max") == 0) {
+++            tr->attn = ATTN_SOFTMAX;
+++        }
+++        return tr->want(t, base, il);
+++    }
+++
+++    tr->on_observed(t, base, il);
+++
+++    // do not charge our own readback / reduction time (or a step-mode wait) to the next segment
+++    const int64_t spent = trace_now_ns() - tr->t_last;
+++    tr->t_last  += spent;
+++    tr->t_layer += spent;
+++    tr->t_ub    += spent;
+++    return true; // keep computing
+++}
+++
+++void server_trace::on_observed(ggml_tensor * t, const char * b, int il) {
+++    const int64_t now = trace_now_ns();
+++    const double  seg = ns_to_ms(now - t_last);
+++    t_last = now;
+++
+++    const bool full = p.detail == SERVER_TRACE_FULL;
+++
+++    if (prefill) {
+++        if (strcmp(b, "l_out") != 0 || il < 0) {
+++            return;
+++        }
+++        if (full) {
+++            json ev = trace_ev("prefill.layer");
+++            ev["batch_i"] = std::max(ub_i, 0);
+++            ev["layer"]   = il;
+++            ev["ms"]      = ns_to_ms(now - t_layer);
+++            emit(std::move(ev));
+++        }
+++        t_layer   = now;
+++        layer_dev = nullptr;
+++        if (il == n_layer - 1) {
+++            in_ub = false;
+++            json ev = trace_ev("prefill.batch");
+++            ev["batch_i"] = std::max(ub_i, 0);
+++            ev["of"]      = 1; // filled in by prefill_done()
+++            ev["from"]    = pass_from;
+++            ev["to"]      = pass_from + ub_ntok;
+++            ev["ms"]      = ns_to_ms(now - t_ub);
+++            prefill_batches.push_back(std::move(ev));
+++            pass_from += ub_ntok;
+++            prefill_n += ub_ntok;
+++        }
+++        return;
+++    }
+++
+++    // decode
+++    const int op = trace_op_of(t, b);
+++    if (op >= 0) {
+++        ops[op] += seg;
+++    }
+++
+++    if (strcmp(b, "embd") == 0) {
+++        trace_read_row(t, t->ne[1] - 1, 0, row_prev);
+++        return;
+++    }
+++    if (il < 0) {
+++        return;
+++    }
+++
+++    if (full && il % p.attn_layers == 0) {
+++        if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+++            attn_flash(t, il);
+++        } else if (strcmp(b, "kq_soft_max") == 0) {
+++            attn_softmax(t, il);
+++        }
+++    }
+++
+++    if (strcmp(b, "ffn_moe_topk") == 0 && t->type == GGML_TYPE_I32) {
+++        moe_ids.resize(t->ne[0]);
+++        ggml_backend_tensor_get(t, moe_ids.data(), (t->ne[1] - 1)*t->nb[1], t->ne[0]*sizeof(int32_t));
+++        return;
+++    }
+++    if (trace_is_moe_weights(b) && t->type == GGML_TYPE_F32) {
+++        // [1, n_expert_used, n_tokens] or [n_expert_used, n_tokens]
+++        const int64_t n  = t->ne[0] == 1 ? t->ne[1] : t->ne[0];
+++        const size_t  nb = t->ne[0] == 1 ? t->nb[2] : t->nb[1];
+++        const int64_t nt = t->ne[0] == 1 ? t->ne[2] : t->ne[1];
+++        moe_w.resize(n);
+++        ggml_backend_tensor_get(t, moe_w.data(), (nt - 1)*nb, n*sizeof(float));
+++        return;
+++    }
+++
+++    if (strcmp(b, "l_out") != 0) {
+++        return;
+++    }
+++
+++    // end of layer il
+++    json ev = trace_ev("decode.layer");
+++    ev["step"]   = step;
+++    ev["layer"]  = il;
+++    ev["ms"]     = ns_to_ms(now - t_layer);
+++    ev["device"] = layer_dev ? layer_dev : trace_device(t);
+++    layer_dev    = nullptr;
+++    t_layer = now;
+++
+++    if (full) {
+++        if (trace_read_row(t, t->ne[1] - 1, 0, row_cur)) {
+++            const float norm  = trace_l2(row_cur.data(), nullptr, row_cur.size());
+++            const float delta = row_prev.size() == row_cur.size() ? trace_l2(row_cur.data(), row_prev.data(), row_cur.size()) : norm;
+++            ev["norm"] = norm;
+++            emit(std::move(ev));
+++
+++            json res = trace_ev("decode.residual");
+++            res["step"]       = step;
+++            res["layer"]      = il;
+++            res["norm"]       = norm;
+++            res["delta_norm"] = delta;
+++            emit(std::move(res));
+++            std::swap(row_prev, row_cur);
+++        } else {
+++            emit(std::move(ev));
+++        }
+++
+++        for (int o = 0; o < OP_COUNT; ++o) {
+++            if (ops[o] > 0.0) {
+++                json oe = trace_ev("decode.op");
+++                oe["step"]  = step;
+++                oe["layer"] = il;
+++                oe["op"]    = OP_NAMES[o];
+++                oe["ms"]    = std::round(ops[o]*1e4)/1e4;
+++                emit(std::move(oe));
+++            }
+++        }
+++
+++        json kv = trace_ev("decode.kv.write");
+++        kv["step"]  = step;
+++        kv["layer"] = il;
+++        kv["pos"]   = pos;
+++        emit(std::move(kv));
+++
+++        if (!moe_ids.empty()) {
+++            json experts = json::array();
+++            for (size_t i = 0; i < moe_ids.size(); ++i) {
+++                experts.push_back({{"id", moe_ids[i]}, {"w", i < moe_w.size() ? moe_w[i] : 0.0f}});
+++            }
+++            json me = trace_ev("decode.moe");
+++            me["step"]    = step;
+++            me["layer"]   = il;
+++            me["experts"] = std::move(experts);
+++            emit(std::move(me));
+++            moe_ids.clear();
+++            moe_w.clear();
+++        }
+++    } else {
+++        emit(std::move(ev));
+++    }
+++    std::fill(std::begin(ops), std::end(ops), 0.0);
+++
+++    if (p.step == SERVER_TRACE_STEP_LAYER) {
+++        wait_step("layer");
+++    }
+++}
+++
+++// kq_soft_max: [n_kv, n_tokens, n_head, n_stream] f32, already softmaxed and masked
+++void server_trace::attn_softmax(ggml_tensor * t, int il) {
+++    if (t->type != GGML_TYPE_F32) {
+++        return;
+++    }
+++    const int64_t n_kv = t->ne[0], n_head = t->ne[2], tok = t->ne[1] - 1;
+++    std::vector<float> avg(n_kv, 0.0f), row;
+++    std::vector<uint8_t> host;
+++    trace_read_all(t, host); // one transfer for all heads
+++    std::vector<std::vector<float>> heads;
+++    for (int64_t h = 0; h < n_head; ++h) {
+++        if (!trace_read_row(t, tok, h, row, host.data())) {
+++            return;
+++        }
+++        for (int64_t j = 0; j < n_kv; ++j) {
+++            avg[j] += row[j] / n_head;
+++        }
+++        if (p.attn_heads) {
+++            heads.push_back(row);
+++        }
+++    }
+++    attn_emit(il, avg, heads);
+++}
+++
+++// flash attention: the softmaxed KQ row never exists, so rebuild it on the CPU for the current
+++// token from the node's inputs: q [d, n_tokens, n_head], k [d, n_kv, n_head_kv] (KV cache view),
+++// mask [n_kv, n_tokens_pad] and the scale / softcap op params (same math as the CPU kernel,
+++// attention sinks and ALiBi are ignored)
+++void server_trace::attn_flash(ggml_tensor * t, int il) {
+++    const ggml_tensor * q = t->src[0];
+++    const ggml_tensor * k = t->src[1];
+++    const ggml_tensor * m = t->src[3];
+++    if (!q || !k || q->ne[0] != k->ne[0] || q->ne[3] != 1 || k->ne[3] != 1) {
+++        return;
+++    }
+++    const int64_t d = q->ne[0], n_head = q->ne[2], n_kv = k->ne[1], n_head_kv = k->ne[2];
+++    const int64_t tok = q->ne[1] - 1;
+++    if (n_head_kv <= 0 || n_head % n_head_kv != 0) {
+++        return;
+++    }
+++    float scale = 1.0f, max_bias = 0.0f, softcap = 0.0f;
+++    memcpy(&scale,    (const float *) t->op_params + 0, sizeof(float));
+++    memcpy(&max_bias, (const float *) t->op_params + 1, sizeof(float));
+++    memcpy(&softcap,  (const float *) t->op_params + 2, sizeof(float));
+++    GGML_UNUSED(max_bias);
+++    if (softcap != 0.0f) {
+++        scale /= softcap;
+++    }
+++
+++    // whole K view in one transfer, then convert row by row
+++    const auto * kt = ggml_get_type_traits(k->type);
+++    if (k->type != GGML_TYPE_F32 && !kt->to_float) {
+++        return;
+++    }
+++    std::vector<uint8_t> kbuf(ggml_nbytes(k));
+++    ggml_backend_tensor_get(k, kbuf.data(), 0, kbuf.size());
+++
+++    std::vector<float> mask;
+++    if (m && !trace_read_row(m, tok, 0, mask)) {
+++        mask.clear();
+++    }
+++
+++    std::vector<float> qrow, krow(d), s(n_kv), avg(n_kv, 0.0f);
+++    std::vector<uint8_t> qbuf;
+++    trace_read_all(q, qbuf); // one transfer for all heads
+++    std::vector<std::vector<float>> heads;
+++    for (int64_t h = 0; h < n_head; ++h) {
+++        if (!trace_read_row(q, tok, h, qrow, qbuf.data())) {
+++            return;
+++        }
+++        const int64_t g = h / (n_head / n_head_kv);
+++        float s_max = -INFINITY;
+++        for (int64_t j = 0; j < n_kv; ++j) {
+++            const uint8_t * kp = kbuf.data() + j*k->nb[1] + g*k->nb[2];
+++            if (k->type == GGML_TYPE_F32) {
+++                memcpy(krow.data(), kp, d*sizeof(float));
+++            } else {
+++                kt->to_float(kp, krow.data(), d);
+++            }
+++            double dot = 0.0;
+++            for (int64_t i = 0; i < d; ++i) {
+++                dot += (double) qrow[i]*krow[i];
+++            }
+++            float v = (float) dot*scale;
+++            if (softcap != 0.0f) {
+++                v = softcap*tanhf(v);
+++            }
+++            if (j < (int64_t) mask.size()) {
+++                v += mask[j];
+++            }
+++            s[j]  = v;
+++            s_max = std::max(s_max, v);
+++        }
+++        if (!std::isfinite(s_max)) {
+++            continue;
+++        }
+++        double sum = 0.0;
+++        for (int64_t j = 0; j < n_kv; ++j) {
+++            s[j] = std::isinf(s[j]) ? 0.0f : expf(s[j] - s_max);
+++            sum += s[j];
+++        }
+++        for (int64_t j = 0; j < n_kv; ++j) {
+++            s[j] = (float) (s[j]/sum);
+++            avg[j] += s[j]/n_head;
+++        }
+++        if (p.attn_heads) {
+++            heads.push_back(s);
+++        }
+++    }
+++    attn_emit(il, avg, heads);
+++}
+++
+++void server_trace::attn_emit(int il, const std::vector<float> & w_avg, const std::vector<std::vector<float>> & w_heads) {
+++    auto top = [&](const std::vector<float> & w) {
+++        std::vector<int32_t> idx(w.size());
+++        for (size_t i = 0; i < idx.size(); ++i) {
+++            idx[i] = (int32_t) i;
+++        }
+++        const size_t k = std::min<size_t>(p.attn_topk, idx.size());
+++        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int32_t a, int32_t b) { return w[a] > w[b]; });
+++        json res = json::array();
+++        for (size_t i = 0; i < k; ++i) {
+++            res.push_back({{"pos", idx[i]}, {"w", w[idx[i]]}});
+++        }
+++        return res;
+++    };
+++    json ev = trace_ev("decode.attn");
+++    ev["step"]  = step;
+++    ev["layer"] = il;
+++    ev["top"]   = top(w_avg);
+++    emit(std::move(ev));
+++    for (size_t h = 0; h < w_heads.size(); ++h) {
+++        json he = trace_ev("decode.attn");
+++        he["step"]  = step;
+++        he["layer"] = il;
+++        he["head"]  = (int) h;
+++        he["top"]   = top(w_heads[h]);
+++        emit(std::move(he));
+++    }
+++}
+++
+++//
+++// sampling
+++//
+++
+++void server_trace::sample_begin(common_sampler * smpl, int32_t step) {
+++    sample_step = step;
+++    draw = -1.0;
+++    // stages are a full-detail event; sample step mode needs them at any detail
+++    if (p.detail == SERVER_TRACE_FULL || p.step == SERVER_TRACE_STEP_SAMPLE) {
+++        common_sampler_set_stage_cb(smpl, stage_cb, this);
+++    }
+++}
+++
+++void server_trace::sample_end(common_sampler * smpl, llama_token id, const common_params_sampling & sparams) {
+++    common_sampler_set_stage_cb(smpl, nullptr, nullptr);
+++
+++    // the last sampler of the chain picks the token
+++    std::string method = "dist";
+++    llama_sampler * chain = common_sampler_get(smpl);
+++    if (chain && llama_sampler_chain_n(chain) > 0) {
+++        method = trace_stage_name(llama_sampler_name(llama_sampler_chain_get(chain, llama_sampler_chain_n(chain) - 1)));
+++    }
+++    if (sparams.backend_sampling) {
+++        no_stages = true;
+++    }
+++
+++    json ev = trace_ev("decode.sample");
+++    ev["step"]      = sample_step;
+++    ev["chosen_id"] = id;
+++    ev["temp"]      = sparams.temp;
+++    ev["top_p"]     = sparams.top_p;
+++    ev["top_k"]     = sparams.top_k;
+++    ev["method"]    = method;
+++    emit(std::move(ev));
+++}
+++
+++void server_trace::stage_cb(llama_sampler * smpl, const char * stage, const llama_token_data_array * cur_p, bool pre, void * user_data) {
+++    auto * tr = (server_trace *) user_data;
+++    if (stage[0] == '?') {
+++        return; // llama_sampler_init_empty(): a sampler disabled by its params, a no-op
+++    }
+++    const std::string name = trace_stage_name(stage);
+++
+++    if (pre) {
+++        // recover the uniform draw of the distribution sampler: a clone shares its RNG state, and
+++        // applied to K equal candidates it selects floor(K*u)
+++        if (name == "dist" && smpl && cur_p->size > 1) {
+++            constexpr int K = 8192;
+++            llama_sampler * c = llama_sampler_clone(smpl);
+++            std::vector<llama_token_data> probe(K);
+++            for (int i = 0; i < K; ++i) {
+++                probe[i] = { i, 0.0f, 0.0f };
+++            }
+++            llama_token_data_array arr = { probe.data(), (size_t) K, -1, false };
+++            llama_sampler_apply(c, &arr);
+++            llama_sampler_free(c);
+++            tr->draw = arr.selected >= 0 ? (arr.selected + 0.5) / K : -1.0;
+++        }
+++        return;
+++    }
+++
+++    auto emit_stage = [&](const char * sname, json && cands, int32_t cutoff, double draw) {
+++        json ev = trace_ev("decode.sample.stage");
+++        ev["step"]       = tr->sample_step;
+++        ev["stage"]      = sname;
+++        ev["candidates"] = std::move(cands);
+++        ev["cutoff"]     = cutoff;
+++        if (draw >= 0.0) {
+++            ev["draw"] = draw;
+++        }
+++        tr->emit(std::move(ev));
+++        if (tr->p.step == SERVER_TRACE_STEP_SAMPLE && tr->step_own) {
+++            {
+++                std::lock_guard<std::mutex> lock(g_step.m);
+++                g_step.at_stage = sname;
+++            }
+++            tr->wait_step("sample");
+++        }
+++    };
+++
+++    int32_t n_alive = 0;
+++    if (name == "dist" || name == "greedy" || name == "mirostat" || name == "mirostat_v2" || name == "adaptive_p") {
+++        const bool has_p = name != "greedy";
+++        if (has_p) {
+++            // probabilities after the final normalisation
+++            json cands = trace_top_candidates(cur_p, tr->p.sample_topn, true, n_alive);
+++            emit_stage("softmax", std::move(cands), n_alive, -1.0);
+++        }
+++        json chosen = json::array();
+++        if (cur_p->selected >= 0 && (size_t) cur_p->selected < cur_p->size) {
+++            const auto & d = cur_p->data[cur_p->selected];
+++            chosen.push_back({{"id", d.id}, {"v", has_p ? d.p : d.logit}});
+++        }
+++        emit_stage("draw", std::move(chosen), (int32_t) cur_p->selected, name == "dist" ? tr->draw : -1.0);
+++        return;
+++    }
+++
+++    json cands = trace_top_candidates(cur_p, tr->p.sample_topn, false, n_alive);
+++    emit_stage(name.c_str(), std::move(cands), n_alive, -1.0);
+++}
++diff --git a/tools/server/server-trace.h b/tools/server/server-trace.h
++new file mode 100644
++index 000000000..0a3024bef
++--- /dev/null
+++++ b/tools/server/server-trace.h
++@@ -0,0 +1,147 @@
+++// [visualizer-trace] per-request inference tracing for llama-server
+++//
+++// A request opts in with a "trace" object (see server_trace_params). The collector observes the
+++// forward pass through the scheduler eval callback, snapshots the sampler chain, and hands the
+++// collected events to the response chunk that carries the token they belong to ("__trace").
+++// No "trace" field: no callback is installed and every hook is a single branch.
+++//
+++// Contract and limitations: ollama-patch/llama.cpp/README.md in the visualizer repository.
+++
+++#pragma once
+++
+++#include "server-common.h"
+++
+++#include "llama.h"
+++#include "sampling.h"
+++
+++#include <cstdint>
+++#include <functional>
+++#include <mutex>
+++#include <string>
+++#include <vector>
+++
+++enum server_trace_detail {
+++    SERVER_TRACE_OFF = 0,
+++    SERVER_TRACE_LAYERS,
+++    SERVER_TRACE_FULL,
+++};
+++
+++enum server_trace_step {
+++    SERVER_TRACE_STEP_NONE = 0,
+++    SERVER_TRACE_STEP_LAYER,
+++    SERVER_TRACE_STEP_SAMPLE,
+++};
+++
+++struct server_trace_params {
+++    server_trace_detail detail = SERVER_TRACE_OFF;
+++
+++    int32_t layer_stride    = 4;     // decode.layer etc. on every step < 8, then every layer_stride-th step
+++    int32_t attn_layers     = 4;     // decode.attn on every attn_layers-th layer
+++    int32_t attn_topk       = 8;     // positions per decode.attn event
+++    bool    attn_heads      = false; // also emit one decode.attn per head
+++    int32_t sample_topn     = 64;    // candidates per decode.sample.stage
+++    server_trace_step step  = SERVER_TRACE_STEP_NONE;
+++    int32_t step_timeout_ms = 60000;
+++
+++    bool enabled() const { return detail != SERVER_TRACE_OFF; }
+++
+++    // throws std::invalid_argument on a malformed object; null -> disabled
+++    static server_trace_params from_json(const json & j);
+++};
+++
+++// trace data attached to one response chunk
+++struct server_trace_payload {
+++    json    events;          // array, or null when there is nothing to send
+++    json    caps;            // array, set on the first chunk only
+++    int32_t id_slot = -1;    // set on the first chunk only
+++    int64_t t_ns    = 0;     // steady_clock ns when the payload was taken
+++
+++    bool empty() const { return events.is_null() && caps.is_null(); }
+++
+++    // adds __trace / __trace_caps / __trace_slot / __trace_t_ns to a chunk object; for an array of
+++    // chunks (OAI chat stream) to the last one, appending a choice-less chunk if the array is empty
+++    void attach(json & res) const;
+++};
+++
+++struct server_trace {
+++    server_trace_params p;
+++
+++    // request lifecycle (main thread)
+++    // flush_fn: sends a trace-only chunk (may be empty); alive_fn: false once the client is gone
+++    void start(const server_trace_params & params, int32_t id_slot, llama_context * ctx,
+++               std::function<void()> flush_fn, std::function<bool()> alive_fn);
+++    void stop();
+++    bool active() const { return p.enabled(); }
+++
+++    // hooks, see server-context.cpp
+++    void before_decode(llama_context * ctx, bool prefill, int32_t step, int32_t pos_first, int32_t pos_last, int32_t n_tokens);
+++    void after_decode (llama_context * ctx);
+++    void prefill_done();
+++    void sample_begin(common_sampler * smpl, int32_t step);
+++    void sample_end  (common_sampler * smpl, llama_token id, const common_params_sampling & sparams);
+++
+++    server_trace_payload take();
+++
+++    // ggml_backend_sched_eval_callback
+++    static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
+++    // common_sampler_stage_cb
+++    static void stage_cb(struct llama_sampler * smpl, const char * stage, const llama_token_data_array * cur_p, bool pre, void * user_data);
+++
+++private:
+++    enum attn_kind { ATTN_NONE, ATTN_SOFTMAX, ATTN_FLASH };
+++
+++    // events/caps_sent are only touched on the slot-loop thread (the eval callback runs there too,
+++    // inside queue_tasks.yield_to_queue()), so no lock is needed
+++    json events = json::array();
+++    bool caps_sent = false;
+++
+++    std::function<void()> flush_fn; // sends a trace-only chunk (stream + step mode)
+++    std::function<bool()> alive_fn; // client still connected
+++    int32_t id_slot  = -1;
+++    int32_t n_layer  = 0;
+++    bool    step_own = false; // holds the global step gate
+++    bool    step_busy = false; // step mode requested, but another request holds the gate
+++    bool    no_stages = false; // backend sampling: no CPU chain to observe
+++    attn_kind attn = ATTN_NONE;
+++
+++    // current pass
+++    bool    prefill  = false;
+++    bool    observe  = false;
+++    int32_t step     = 0;
+++    int32_t pos      = 0;   // decode: position of the input token
+++    int32_t cur_layer = -1; // last layer index seen in the ask phase
+++    bool    in_ub    = false;
+++    int64_t t_last   = 0;   // last observation
+++    int64_t t_layer  = 0;   // start of the current layer
+++    int64_t t_ub     = 0;   // start of the current ubatch
+++    double  ops[7]   = {};  // per-op ms in the current layer
+++    const char * layer_dev = nullptr; // device of the current layer's weights
+++
+++    // prefill
+++    int32_t ub_i       = -1;
+++    int32_t ub_ntok    = 0;
+++    int32_t pass_from  = 0; // pos of the next ubatch's first token
+++    int32_t prefill_n  = 0;
+++    int64_t t_prefill  = 0;
+++    std::vector<json> prefill_batches; // held until prefill_done() to fill in "of"
+++
+++    // decode full detail
+++    std::vector<float> row_prev, row_cur; // residual stream rows
+++    std::vector<int32_t> moe_ids;
+++    std::vector<float>   moe_w;
+++
+++    // sampling
+++    int32_t sample_step = 0;
+++    double  draw = -1.0;
+++
+++    void emit(json && ev);
+++    bool want(const struct ggml_tensor * t, const char * base, int il) const;
+++    void on_observed(struct ggml_tensor * t, const char * base, int il);
+++    void attn_softmax(struct ggml_tensor * t, int il);
+++    void attn_flash  (struct ggml_tensor * t, int il);
+++    void attn_emit(int il, const std::vector<float> & w_avg, const std::vector<std::vector<float>> & w_heads);
+++    void wait_step(const char * granularity);
+++};
+++
+++// POST /trace/ack body -> response body
+++json server_trace_ack(const json & body);
++diff --git a/tools/server/server.cpp b/tools/server/server.cpp
++index 8b1d42650..982c26a1d 100644
++--- a/tools/server/server.cpp
+++++ b/tools/server/server.cpp
++@@ -5,6 +5,7 @@
++ #include "server-cors-proxy.h"
++ #include "server-stream.h"
++ #include "server-tools.h"
+++#include "server-trace.h" // [visualizer-trace]
++ 
++ #include "arg.h"
++ #include "build-info.h"
++@@ -175,6 +176,23 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
++     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
++     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
++     ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));
+++    // [visualizer-trace] step-mode ack; answered on the HTTP thread, it does not go through the task
+++    // queue because the slot loop is blocked while it waits for the ack
+++    ctx_http.post("/trace/ack", [](const server_http_req & req) {
+++        auto res = std::make_unique<server_http_res>();
+++        json body;
+++        try {
+++            body = req.body.empty() ? json::object() : json::parse(req.body);
+++        } catch (const std::exception &) {
+++            res->status = 400;
+++            res->data   = safe_json_to_str(json{{"ok", false}, {"error", "invalid JSON body"}});
+++            return res;
+++        }
+++        json out = server_trace_ack(body);
+++        res->status = out.value("ok", false) ? 200 : 409;
+++        res->data   = safe_json_to_str(out);
+++        return res;
+++    });
++     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
++     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
++     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
+-- 
+2.47.1.windows.2
+

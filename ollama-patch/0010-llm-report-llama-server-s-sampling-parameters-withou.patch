@@ -1,0 +1,82 @@
+From cc93555e81879fcac84d88270f89193413d2e594 Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 16:56:56 -0700
+Subject: [PATCH 10/10] llm: report llama-server's sampling parameters without
+ float32 noise
+
+decode.sample from llama-server carries temp/top_p as float32 widened to
+double (0.800000011920929); round them like the Go-built event does.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ llm/llama_server_runner_trace.go      | 23 ++++++++++++++++++++++-
+ llm/llama_server_runner_trace_test.go |  8 ++++++++
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/llm/llama_server_runner_trace.go b/llm/llama_server_runner_trace.go
+index d48711cc..e3a92b01 100644
+--- a/llm/llama_server_runner_trace.go
++++ b/llm/llama_server_runner_trace.go
+@@ -11,6 +11,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"slices"
++	"strconv"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -426,6 +427,26 @@ func (d *traceDecode) rebase(tns int64) int64 {
+ 	return max(tns+d.offset, 0)
+ }
+ 
++// tidySample rounds llama-server's float32 sampling parameters in a
++// decode.sample payload to their shortest decimal form (0.8, not
++// 0.800000011920929), matching the parameters Ollama reports itself.
++func tidySample(body []byte) []byte {
++	var m map[string]json.RawMessage
++	if json.Unmarshal(body, &m) != nil {
++		return body
++	}
++	for _, k := range []string{"temp", "top_p"} {
++		var v float64
++		if json.Unmarshal(m[k], &v) == nil {
++			m[k] = json.RawMessage(strconv.FormatFloat(float64(float32(v)), 'g', -1, 32))
++		}
++	}
++	if out, err := json.Marshal(m); err == nil {
++		return out
++	}
++	return body
++}
++
+ type runnerSample struct {
+ 	body []byte
+ 	tns  int64
+@@ -460,7 +481,7 @@ func (d *traceDecode) complete(ctx context.Context, s, target int, probs []llama
+ 	}
+ 	if ps, ok := d.pendingSample[s]; ok {
+ 		delete(d.pendingSample, s)
+-		d.tr.Forward("decode.sample", ps.body, ps.tns)
++		d.tr.Forward("decode.sample", tidySample(ps.body), ps.tns)
+ 	} else {
+ 		if eos && s == target && chosen < 0 {
+ 			chosen = d.eosID
+diff --git a/llm/llama_server_runner_trace_test.go b/llm/llama_server_runner_trace_test.go
+index faa0dbdb..538c79f2 100644
+--- a/llm/llama_server_runner_trace_test.go
++++ b/llm/llama_server_runner_trace_test.go
+@@ -610,3 +610,11 @@ func TestRunnerTraceChatChunks(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestTidySample(t *testing.T) {
++	got := string(tidySample([]byte(`{"step":0,"chosen_id":791,"temp":0.800000011920929,"top_p":0.8999999761581421,"top_k":40,"method":"dist"}`)))
++	want := `{"chosen_id":791,"method":"dist","step":0,"temp":0.8,"top_k":40,"top_p":0.9}`
++	if got != want {
++		t.Errorf("tidySample = %s, want %s", got, want)
++	}
++}
+-- 
+2.47.1.windows.2
+

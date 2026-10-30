@@ -253,9 +253,37 @@ describe('engine: real Ollama traces (traces/real)', () => {
       expect(errors).toEqual([]);
       const r = simulate(events, { detail: 'full' });
       expect(r.vm.phase).toBe('done');
-      expect(r.vm.capabilities).toContain('no_layers');
+      if (f.includes('-full')) {
+        // patched llama-server: real per-layer, op and sampler-stage data
+        expect(r.vm.capabilities).not.toContain('no_layers');
+        expect(events.some((e) => e.type === 'decode.op')).toBe(true);
+        expect(events.some((e) => e.type === 'decode.sample.stage')).toBe(true);
+      } else {
+        expect(r.vm.capabilities).toContain('no_layers');
+      }
       const resp = resolve(dir, f.replace('.ndjson', '.response.txt'));
       if (existsSync(resp)) expect(r.vm.responseText).toBe(readFileSync(resp, 'utf8'));
     });
   }
+});
+
+describe('engine: degraded live run rebuilds final detail', () => {
+  it('after fast-forwarding, the last step has its forward-pass and sampler detail', () => {
+    const tr = generateTrace({
+      detail: 'full',
+      layers: 16,
+      responseTokens: 40,
+      promptTokens: 20,
+      tokPerSec: 100,
+      loadMs: 0,
+      seed: 8,
+    });
+    const r = simulate(tr.events, { detail: 'full' });
+    expect(r.sawDegraded).toBe(true);
+    // run one more frame so the end-of-run rebuild happens
+    const last = r.vm.steps[r.vm.currentStep];
+    expect(r.vm.phase).toBe('done');
+    expect(last?.samplingStages.length ?? 0).toBeGreaterThan(0);
+    expect(last?.ops.length ?? 0).toBeGreaterThan(0);
+  });
 });

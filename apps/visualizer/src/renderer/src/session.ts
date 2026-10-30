@@ -520,7 +520,13 @@ export class Session {
       this.sendAck(run, true);
       setUi({ stepMode: false });
     }
-    this.active?.clock.resume();
+    const c = this.active?.clock;
+    if (c) {
+      // drop any pending Step so playback doesn't pause again at the next match
+      c.stopWhen = null;
+      c.stoppingLabel = null;
+      c.resume();
+    }
   }
 
   private sendAck(run: RunState, cont = false) {

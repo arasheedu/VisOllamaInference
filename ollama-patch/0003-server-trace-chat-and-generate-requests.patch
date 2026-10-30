@@ -1,7 +1,7 @@
 From adde0330b1741eef576ee2603fed2b61ee046281 Mon Sep 17 00:00:00 2001
 From: Rasheed <arasheedu@gmail.com>
 Date: Thu, 29 Oct 2026 14:53:48 -0700
-Subject: [PATCH 3/3] server: trace chat and generate requests
+Subject: [PATCH 03/10] server: trace chat and generate requests
 
 Read X-Trace-Request-Id, X-Trace-Detail and X-Trace-Step, attach a tracer
 to the request context and emit request.received, model.load start/done,

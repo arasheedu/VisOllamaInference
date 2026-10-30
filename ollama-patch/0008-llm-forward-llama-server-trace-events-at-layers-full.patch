@@ -1,0 +1,1376 @@
+From 91f87bed9bc42cc97630f4a66ed91d3513bac3cc Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 16:46:52 -0700
+Subject: [PATCH 08/10] llm: forward llama-server trace events at layers/full
+ detail
+
+When a request is traced at layers/full detail, or in layer/sample step
+mode, and the runner has the visualizer patch (probed once per runner with
+POST /trace/ack: 409 patched, 404 stock), add the trace object to the
+/completion and /v1/chat/completions requests and forward the __trace
+events of every chunk through the request tracer:
+
+- steps shifted from llama-server's 1-based to the tracer's 0-based count;
+  one tracer step per generated token (predicted_n), so they line up
+- t_ns rebased with the smallest receive-minus-__trace_t_ns offset seen
+- events sorted by t_ns (prefill.batch is held back by llama-server)
+- llama-server's prefill.batch/done and decode.sample replace the
+  synthesized ones; decode.logits still comes from n_probs
+- trace-only chunks (content "" or choices []) are forwarded at once and
+  skip the token-repeat check; the chat final array's trailing chunks
+  are drained for their events
+- step-mode acks are posted to /trace/ack, and continue is sent when the
+  request ends, the client goes away or the visualizer socket drops
+
+Requests at basic detail, with tracing off or to a stock runner carry no
+trace field.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ llm/llama_server.go                   |  80 ++--
+ llm/llama_server_runner_trace.go      | 495 +++++++++++++++++++++
+ llm/llama_server_runner_trace_test.go | 612 ++++++++++++++++++++++++++
+ llm/llama_server_trace.go             |  16 +-
+ 4 files changed, 1174 insertions(+), 29 deletions(-)
+ create mode 100644 llm/llama_server_runner_trace.go
+ create mode 100644 llm/llama_server_runner_trace_test.go
+
+diff --git a/llm/llama_server.go b/llm/llama_server.go
+index 37ccb6a7..921680cc 100644
+--- a/llm/llama_server.go
++++ b/llm/llama_server.go
+@@ -181,6 +181,9 @@ type llamaServerRunner struct {
+ 	// used to map DeviceIDs to device names for VRAMByGPU lookups.
+ 	gpus []ml.DeviceInfo
+ 
++	traceProbeOnce sync.Once // probeTrace
++	tracePatched   bool
++
+ 	metadata      *gguf.Model
+ 	totalLayers   uint64 // maximum offloadable model layers
+ 	loadStart     time.Time
+@@ -1448,27 +1451,28 @@ func (s *llamaServerRunner) lastErrMsg() string {
+ 
+ // llamaServerCompletionRequest is the request format for llama-server's POST /completion endpoint.
+ type llamaServerCompletionRequest struct {
+-	Prompt          any             `json:"prompt"`
+-	Stream          bool            `json:"stream"`
+-	CachePrompt     bool            `json:"cache_prompt"`
+-	NPredict        int             `json:"n_predict,omitempty"`
+-	NKeep           int             `json:"n_keep,omitempty"`
+-	Temperature     float32         `json:"temperature"`
+-	TopK            int             `json:"top_k"`
+-	TopP            float32         `json:"top_p"`
+-	MinP            float32         `json:"min_p"`
+-	Stop            []string        `json:"stop,omitempty"`
+-	RepeatPenalty   float32         `json:"repeat_penalty"`
+-	RepeatLastN     int             `json:"repeat_last_n"`
+-	FreqPenalty     float32         `json:"frequency_penalty"`
+-	PresPenalty     float32         `json:"presence_penalty"`
+-	TypicalP        float32         `json:"typical_p,omitempty"`
+-	Seed            int             `json:"seed"`
+-	Grammar         string          `json:"grammar,omitempty"`
+-	JsonSchema      json.RawMessage `json:"json_schema,omitempty"`
+-	NProbs          int             `json:"n_probs,omitempty"`
+-	PreservedTokens []string        `json:"preserved_tokens,omitempty"`
+-	TimingsPerToken bool            `json:"timings_per_token,omitempty"`
++	Prompt          any                 `json:"prompt"`
++	Stream          bool                `json:"stream"`
++	CachePrompt     bool                `json:"cache_prompt"`
++	NPredict        int                 `json:"n_predict,omitempty"`
++	NKeep           int                 `json:"n_keep,omitempty"`
++	Temperature     float32             `json:"temperature"`
++	TopK            int                 `json:"top_k"`
++	TopP            float32             `json:"top_p"`
++	MinP            float32             `json:"min_p"`
++	Stop            []string            `json:"stop,omitempty"`
++	RepeatPenalty   float32             `json:"repeat_penalty"`
++	RepeatLastN     int                 `json:"repeat_last_n"`
++	FreqPenalty     float32             `json:"frequency_penalty"`
++	PresPenalty     float32             `json:"presence_penalty"`
++	TypicalP        float32             `json:"typical_p,omitempty"`
++	Seed            int                 `json:"seed"`
++	Grammar         string              `json:"grammar,omitempty"`
++	JsonSchema      json.RawMessage     `json:"json_schema,omitempty"`
++	NProbs          int                 `json:"n_probs,omitempty"`
++	PreservedTokens []string            `json:"preserved_tokens,omitempty"`
++	TimingsPerToken bool                `json:"timings_per_token,omitempty"`
++	Trace           *runnerTraceRequest `json:"trace,omitempty"`
+ }
+ 
+ // schemaGrammars caches the grammars llama-server derives from JSON schemas,
+@@ -1608,6 +1612,7 @@ type llamaServerCompletionResponse struct {
+ 	StopType                string                 `json:"stop_type"`
+ 	Timings                 llamaServerTimings     `json:"timings"`
+ 	CompletionProbabilities []llamaServerTokenProb `json:"completion_probabilities"`
++	runnerTraceChunk
+ }
+ 
+ type llamaServerChatChoice struct {
+@@ -1634,6 +1639,7 @@ type llamaServerChatResponse struct {
+ 	Choices []llamaServerChatChoice `json:"choices"`
+ 	Timings llamaServerTimings      `json:"timings"`
+ 	Error   any                     `json:"error"`
++	runnerTraceChunk
+ }
+ 
+ type llamaServerTimings struct {
+@@ -1724,6 +1730,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
+ 	if td != nil {
+ 		lsReq.NProbs = max(lsReq.NProbs, traceTopK)
+ 		lsReq.TimingsPerToken = true
++		lsReq.Trace = td.runnerTrace(ctx, s)
+ 	}
+ 
+ 	// Handle format: pass JSON schema directly to llama-server, or use grammar
+@@ -1806,6 +1813,8 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
+ 		return errors.New("model runner has unexpectedly stopped, this may be due to resource limitations or an internal error, check ollama server logs for details")
+ 	}
+ 	defer res.Body.Close()
++	// Runs before the body is closed: releases llama-server step mode.
++	defer td.forwardAcks(s)()
+ 
+ 	if res.StatusCode >= 400 {
+ 		bodyBytes, err := io.ReadAll(res.Body)
+@@ -1851,6 +1860,13 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
+ 				return fmt.Errorf("error unmarshalling llama-server response: %v", err)
+ 			}
+ 
++			eos := lsResp.Stop && lsResp.StopType == "eos"
++			td.chunk(ctx, &lsResp.runnerTraceChunk, lsResp.Timings, lsResp.CompletionProbabilities, lsResp.Content != "" || eos, eos)
++			if lsResp.Content == "" && !lsResp.Stop && len(lsResp.Trace) > 0 {
++				// Trace-only chunk (llama-server visualizer trace): no text.
++				continue
++			}
++
+ 			// Token repeat detection
+ 			switch {
+ 			case strings.TrimSpace(lsResp.Content) == lastToken:
+@@ -1865,7 +1881,6 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
+ 			}
+ 
+ 			if lsResp.Content != "" && !lsResp.Stop {
+-				td.step(ctx, lsResp.Timings, lsResp.CompletionProbabilities, false)
+ 				fn(CompletionResponse{
+ 					Content:  lsResp.Content,
+ 					Logprobs: userLogprobs(lsResp.CompletionProbabilities, req.Logprobs, req.TopLogprobs),
+@@ -1873,10 +1888,6 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
+ 			}
+ 
+ 			if lsResp.Stop {
+-				if td != nil && (lsResp.Content != "" || lsResp.StopType == "eos") {
+-					td.step(ctx, lsResp.Timings, lsResp.CompletionProbabilities, lsResp.StopType == "eos")
+-				}
+-
+ 				doneReason := DoneReasonStop
+ 				if lsResp.StopType == "limit" {
+ 					doneReason = DoneReasonLength
+@@ -2088,6 +2099,9 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
+ 		lsReq["logprobs"] = true
+ 		lsReq["top_logprobs"] = max(topLogprobs, traceTopK)
+ 		lsReq["timings_per_token"] = true
++		if rt := td.runnerTrace(ctx, s); rt != nil {
++			lsReq["trace"] = rt
++		}
+ 		if !chatRequestHasMedia(req) {
+ 			// The native path renders the prompt inside llama-server, so ask it
+ 			// for the same rendering to tokenize.
+@@ -2126,6 +2140,8 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
+ 		return errors.New("model runner has unexpectedly stopped, this may be due to resource limitations or an internal error, check ollama server logs for details")
+ 	}
+ 	defer res.Body.Close()
++	// Runs before the body is closed: releases llama-server step mode.
++	defer td.forwardAcks(s)()
+ 
+ 	if res.StatusCode >= 400 {
+ 		bodyBytes, err := io.ReadAll(res.Body)
+@@ -2173,6 +2189,9 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
+ 				return fmt.Errorf("llama-server chat error: %v", lsResp.Error)
+ 			}
+ 			if len(lsResp.Choices) == 0 {
++				// Trace-only chunk (llama-server visualizer trace), or a token
++				// without a delta such as EOS.
++				td.chunk(ctx, &lsResp.runnerTraceChunk, lsResp.Timings, nil, false, false)
+ 				continue
+ 			}
+ 
+@@ -2190,9 +2209,14 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
+ 				hasDelta := choice.Delta.Content != "" || choice.Delta.ReasoningContent != "" ||
+ 					len(choice.Delta.ToolCalls) > 0 || len(choice.Logprobs.Content) > 0
+ 				eos := choice.FinishReason != nil && *choice.FinishReason == "stop"
+-				if hasDelta || eos {
+-					td.step(ctx, lsResp.Timings, choice.Logprobs.Content, eos)
++				rt := lsResp.runnerTraceChunk
++				if choice.FinishReason != nil && td.native {
++					// The last events ride on the final array's last chunk.
++					for scanner.Scan() {
++						drainTraceLine(scanner.Bytes(), &rt)
++					}
+ 				}
++				td.chunk(ctx, &rt, lsResp.Timings, choice.Logprobs.Content, hasDelta || eos, eos)
+ 			}
+ 
+ 			for _, tc := range choice.Delta.ToolCalls {
+diff --git a/llm/llama_server_runner_trace.go b/llm/llama_server_runner_trace.go
+new file mode 100644
+index 00000000..d48711cc
+--- /dev/null
++++ b/llm/llama_server_runner_trace.go
+@@ -0,0 +1,495 @@
++package llm
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"log/slog"
++	"math"
++	"net/http"
++	"os"
++	"path/filepath"
++	"slices"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/ollama/ollama/envconfig"
++)
++
++// A llama-server built with the visualizer trace patch (llama/compat/
++// 100-visualizer-trace.patch) accepts a "trace" object on completion
++// requests, attaches its own events to the streamed chunks (__trace,
++// __trace_t_ns, __trace_caps, __trace_slot) and gates layer/sample step mode
++// with POST /trace/ack. Ollama forwards those events through the request
++// tracer, adding req/seq and rebasing t_ns onto its own clock.
++
++// runnerTraceRequest is the "trace" object of a llama-server request.
++type runnerTraceRequest struct {
++	Detail        string `json:"detail"`
++	LayerStride   uint   `json:"layer_stride"`
++	AttnLayers    uint   `json:"attn_layers"`
++	AttnHeads     bool   `json:"attn_heads"`
++	Step          string `json:"step,omitempty"`
++	StepTimeoutMS int64  `json:"step_timeout_ms,omitempty"`
++}
++
++// runnerTraceChunk holds the trace fields of one streamed llama-server chunk.
++type runnerTraceChunk struct {
++	Trace []json.RawMessage `json:"__trace,omitempty"`
++	TNs   *int64            `json:"__trace_t_ns,omitempty"`
++	Caps  []string          `json:"__trace_caps,omitempty"`
++	Slot  *int              `json:"__trace_slot,omitempty"`
++}
++
++func (c *runnerTraceChunk) merge(o runnerTraceChunk) {
++	c.Trace = append(c.Trace, o.Trace...)
++	if o.TNs != nil {
++		c.TNs = o.TNs
++	}
++	if o.Caps != nil {
++		c.Caps = o.Caps
++	}
++	if o.Slot != nil {
++		c.Slot = o.Slot
++	}
++}
++
++// runnerEvent is one event from __trace with its step already converted to
++// Ollama's 0-based numbering (-1 for events without a step).
++type runnerEvent struct {
++	typ  string
++	tns  int64 // llama-server steady clock
++	step int
++	body []byte // payload without type and t_ns
++}
++
++// parseRunnerEvent converts a llama-server event. llama-server numbers steps
++// from 1 (the first generated token); Ollama's tracer, and the visualizer,
++// from 0.
++func parseRunnerEvent(raw json.RawMessage) (runnerEvent, error) {
++	var m map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &m); err != nil {
++		return runnerEvent{}, err
++	}
++	ev := runnerEvent{step: -1}
++	if err := json.Unmarshal(m["type"], &ev.typ); err != nil || ev.typ == "" {
++		return runnerEvent{}, fmt.Errorf("trace event without type: %s", raw)
++	}
++	var tns float64
++	if err := json.Unmarshal(m["t_ns"], &tns); err != nil {
++		return runnerEvent{}, fmt.Errorf("trace event without t_ns: %s", raw)
++	}
++	ev.tns = int64(tns)
++	delete(m, "type")
++	delete(m, "t_ns")
++	for _, k := range []string{"v", "req", "seq"} {
++		delete(m, k)
++	}
++	if s, ok := m["step"]; ok {
++		var step int
++		if err := json.Unmarshal(s, &step); err != nil {
++			return runnerEvent{}, fmt.Errorf("trace event with bad step: %s", raw)
++		}
++		ev.step = max(step-1, 0)
++		m["step"] = json.RawMessage(fmt.Appendf(nil, "%d", ev.step))
++	}
++	body, err := json.Marshal(m)
++	if err != nil {
++		return runnerEvent{}, err
++	}
++	ev.body = body
++	return ev, nil
++}
++
++// ---- capability detection -------------------------------------------------
++
++// runnerTraceState caches whether llama-server has the trace patch: 0 not
++// known yet, 1 patched, 2 stock. A runner probe overrides the binary scan.
++var (
++	runnerTraceState atomic.Int32
++	runnerTraceScan  sync.Once
++)
++
++const runnerTraceMarker = "__trace_caps"
++
++// RunnerTraceSupported reports whether llama-server runners support the
++// visualizer trace protocol. It is needed before any runner is up (for
++// request.received), so until a runner has been probed it is answered by
++// looking for the protocol's field name in the llama-server binaries.
++func RunnerTraceSupported() bool {
++	if s := runnerTraceState.Load(); s != 0 {
++		return s == 1
++	}
++	runnerTraceScan.Do(func() {
++		patched := scanLlamaServerForTrace()
++		runnerTraceState.CompareAndSwap(0, map[bool]int32{true: 1, false: 2}[patched])
++		slog.Info("llama-server trace support", "patched", patched, "source", "binary scan")
++	})
++	return runnerTraceState.Load() == 1
++}
++
++func scanLlamaServerForTrace() bool {
++	exe, err := FindLlamaServer()
++	if err != nil {
++		return false
++	}
++	files := []string{exe}
++	for _, pat := range []string{"*llama-server-impl*", "*llama-server*.dll", "*llama-server*.so", "*llama-server*.dylib"} {
++		m, _ := filepath.Glob(filepath.Join(filepath.Dir(exe), pat))
++		files = append(files, m...)
++	}
++	slices.Sort(files)
++	for _, f := range slices.Compact(files) {
++		if data, err := os.ReadFile(f); err == nil && bytes.Contains(data, []byte(runnerTraceMarker)) {
++			return true
++		}
++	}
++	return false
++}
++
++// probeTrace asks this runner once whether it has the trace patch. POST
++// /trace/ack to a slot that cannot exist is answered 409 by a patched
++// llama-server (whether or not another request is stepping, and without
++// counting as an ack) and 404 by a stock one.
++func (s *llamaServerRunner) probeTrace(ctx context.Context) bool {
++	s.traceProbeOnce.Do(func() {
++		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
++		defer cancel()
++		code, err := s.postTraceAck(ctx, map[string]any{"id_slot": math.MaxInt32})
++		s.tracePatched = err == nil && code == http.StatusConflict
++		if err == nil {
++			runnerTraceState.Store(map[bool]int32{true: 1, false: 2}[s.tracePatched])
++		}
++		slog.Info("llama-server trace support", "patched", s.tracePatched, "source", "probe", "status", code, "error", err)
++	})
++	return s.tracePatched
++}
++
++var traceAckClient = &http.Client{Timeout: 5 * time.Second}
++
++func (s *llamaServerRunner) postTraceAck(ctx context.Context, body map[string]any) (int, error) {
++	data, err := json.Marshal(body)
++	if err != nil {
++		return 0, err
++	}
++	r, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/trace/ack", s.port), bytes.NewReader(data))
++	if err != nil {
++		return 0, err
++	}
++	r.Header.Set("Content-Type", "application/json")
++	resp, err := traceAckClient.Do(r)
++	if err != nil {
++		return 0, err
++	}
++	resp.Body.Close()
++	return resp.StatusCode, nil
++}
++
++// ---- request ------------------------------------------------------------
++
++// runnerTrace returns the "trace" object for this request's llama-server
++// call, or nil when the request does not want runner events or the runner
++// is stock. A nil result leaves the request byte-identical to an untraced
++// one apart from the basic-tier fields (n_probs, timings_per_token).
++func (d *traceDecode) runnerTrace(ctx context.Context, s *llamaServerRunner) *runnerTraceRequest {
++	if d == nil || !d.tr.WantsRunnerTrace() {
++		return nil
++	}
++	if !s.probeTrace(ctx) {
++		d.tr.DisableRunnerStep()
++		return nil
++	}
++	d.native = true
++	r := &runnerTraceRequest{
++		Detail:      "layers",
++		LayerStride: max(envconfig.TraceLayerStride(), 1),
++		AttnLayers:  max(envconfig.TraceAttnLayers(), 1),
++		AttnHeads:   envconfig.TraceAttnHeads(),
++	}
++	if d.tr.Detail().String() == "full" {
++		r.Detail = "full"
++	}
++	if step := d.tr.RunnerStep(); step != "" {
++		if d.tr.HubConnected() {
++			r.Step = step
++			r.StepTimeoutMS = envconfig.TraceStepTimeout().Milliseconds()
++		} else {
++			d.tr.DisableRunnerStep()
++		}
++	}
++	return r
++}
++
++// forwardAcks passes the visualizer's step-mode acks on to llama-server's
++// POST /trace/ack until the returned stop function is called. stop sends
++// {"continue":true}, so llama-server never waits for a request that ended
++// or a client that went away; so does losing the visualizer socket.
++func (d *traceDecode) forwardAcks(s *llamaServerRunner) (stop func()) {
++	if d == nil || !d.native {
++		return func() {}
++	}
++	acks := d.tr.RunnerAcks()
++	if acks == nil {
++		return func() {}
++	}
++	post := func(cont bool) {
++		body := map[string]any{}
++		if slot := d.slot.Load(); slot >= 0 {
++			body["id_slot"] = slot
++		}
++		if cont {
++			body["continue"] = true
++		}
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		if code, err := s.postTraceAck(ctx, body); err != nil || (code != http.StatusOK && code != http.StatusConflict) {
++			slog.Debug("trace: ack to llama-server failed", "status", code, "error", err)
++		}
++	}
++	done := make(chan struct{})
++	finished := make(chan struct{})
++	go func() {
++		defer close(finished)
++		tick := time.NewTicker(250 * time.Millisecond)
++		defer tick.Stop()
++		for {
++			select {
++			case cont := <-acks:
++				post(cont)
++				if cont {
++					return
++				}
++			case <-tick.C:
++				if !d.tr.HubConnected() {
++					post(true)
++					return
++				}
++			case <-done:
++				return
++			}
++		}
++	}()
++	var once sync.Once
++	return func() {
++		once.Do(func() {
++			close(done)
++			<-finished
++			post(true)
++		})
++	}
++}
++
++// ---- chunks ---------------------------------------------------------------
++
++// chunk handles one streamed llama-server chunk. tokenChunk is true when the
++// chunk carries generated text (or the EOS stop); trace-only chunks only
++// carry runner events.
++func (d *traceDecode) chunk(ctx context.Context, rt *runnerTraceChunk, t llamaServerTimings, probs []llamaServerTokenProb, tokenChunk, eos bool) {
++	if d == nil {
++		return
++	}
++	if !d.native {
++		if tokenChunk {
++			d.step(ctx, t, probs, eos)
++		}
++		return
++	}
++	d.runnerChunk(ctx, rt, t, probs, tokenChunk, eos)
++}
++
++func (d *traceDecode) runnerChunk(ctx context.Context, rt *runnerTraceChunk, t llamaServerTimings, probs []llamaServerTokenProb, tokenChunk, eos bool) {
++	if rt.TNs != nil {
++		d.observeClock(d.tr.Now(), *rt.TNs)
++	}
++	if rt.Slot != nil {
++		d.slot.Store(int32(*rt.Slot))
++	}
++	if rt.Caps != nil && !d.capsSeen {
++		d.capsSeen = true
++		if len(rt.Caps) > 0 {
++			slog.Info("llama-server trace capabilities missing", "req", d.tr.ID(), "caps", rt.Caps)
++		}
++		if slices.Contains(rt.Caps, "no_step") {
++			// Another request holds llama-server's step gate.
++			d.tr.DisableRunnerStep()
++		}
++	}
++
++	evs := make([]runnerEvent, 0, len(rt.Trace))
++	for _, raw := range rt.Trace {
++		ev, err := parseRunnerEvent(raw)
++		if err != nil {
++			slog.Debug("trace: bad llama-server event", "error", err)
++			continue
++		}
++		evs = append(evs, ev)
++	}
++	// prefill.batch events are held back until the prefill ends, so a chunk
++	// is not in time order.
++	slices.SortStableFunc(evs, func(a, b runnerEvent) int {
++		switch {
++		case a.tns < b.tns:
++			return -1
++		case a.tns > b.tns:
++			return 1
++		}
++		return 0
++	})
++
++	// Steps whose token is complete with this chunk get decode.logits and
++	// decode.sample. predicted_n counts every token sampled so far, so it
++	// also covers tokens whose text llama-server held back.
++	target := d.completed
++	if t.PredictN > 0 {
++		target = max(target, t.PredictN-1)
++	} else if tokenChunk {
++		target = max(target+1, d.tr.CurrentStep())
++	}
++
++	var stepped []runnerEvent
++	for _, ev := range evs {
++		if ev.step >= 0 {
++			stepped = append(stepped, ev)
++			continue
++		}
++		switch ev.typ {
++		case "prefill.batch":
++			d.realPrefill = true
++			var b struct {
++				To int `json:"to"`
++			}
++			if json.Unmarshal(ev.body, &b) == nil {
++				d.prefillTo = max(d.prefillTo, b.To)
++			}
++		case "prefill.done":
++			d.realPrefill = true
++		}
++		d.tr.Forward(ev.typ, ev.body, d.rebase(ev.tns))
++	}
++	if d.realPrefill && !d.prefilled {
++		d.prefilled = true
++		d.promptTotal = d.prefillTo
++		if t.PromptN > 0 || t.CacheN != nil {
++			d.promptTotal = t.promptEvalCount()
++		}
++	}
++
++	for i := 0; i < len(stepped); {
++		s := stepped[i].step
++		j := i
++		for j < len(stepped) && stepped[j].step == s {
++			j++
++		}
++		if s > d.completed {
++			d.advance(ctx, s, d.rebase(stepped[i].tns), t)
++		}
++		for _, ev := range stepped[i:j] {
++			if ev.typ == "decode.sample" {
++				if s > d.completed {
++					d.pendingSample[s] = runnerSample{body: ev.body, tns: d.rebase(ev.tns)}
++				}
++				continue
++			}
++			d.tr.Forward(ev.typ, ev.body, d.rebase(ev.tns))
++		}
++		if s <= target && s > d.completed {
++			d.complete(ctx, s, target, probs, eos, t)
++		}
++		i = j
++	}
++	for s := d.completed + 1; s <= target; s++ {
++		d.complete(ctx, s, target, probs, eos, t)
++	}
++	if eos {
++		d.tr.MarkEOS()
++	}
++}
++
++// observeClock updates the llama-server to tracer clock offset from a chunk
++// built at sent (llama-server steady clock) and received at recv (tracer
++// clock). The smallest gap seen has the least transport delay in it, so it is
++// the best estimate.
++func (d *traceDecode) observeClock(recv, sent int64) {
++	if off := recv - sent; !d.hasOffset || off < d.offset {
++		d.offset, d.hasOffset = off, true
++	}
++}
++
++// rebase converts a llama-server timestamp to the tracer clock (-1 = now
++// when no chunk has carried __trace_t_ns yet).
++func (d *traceDecode) rebase(tns int64) int64 {
++	if !d.hasOffset {
++		return -1
++	}
++	return max(tns+d.offset, 0)
++}
++
++type runnerSample struct {
++	body []byte
++	tns  int64
++}
++
++// advance starts every step up to s. The first decode.step.start of a step
++// takes the time of its first runner event.
++func (d *traceDecode) advance(ctx context.Context, s int, tns int64, t llamaServerTimings) {
++	if !d.prefilled {
++		d.prefill(t)
++	}
++	for cur := d.tr.CurrentStep() + 1; cur <= s; cur++ {
++		at := int64(-1)
++		if cur == s {
++			at = tns
++		}
++		d.tr.StepStartAt(ctx, d.promptTotal+cur, d.kvTotal, at)
++	}
++}
++
++// complete emits decode.logits and decode.sample for step s, whose token
++// arrived with this chunk. The chunk's probabilities end with its last
++// token (target), so they are matched from the end.
++func (d *traceDecode) complete(ctx context.Context, s, target int, probs []llamaServerTokenProb, eos bool, t llamaServerTimings) {
++	d.advance(ctx, s, -1, t)
++	chosen := -1
++	if i := len(probs) - 1 - (target - s); i >= 0 && i < len(probs) {
++		chosen = probs[i].ID
++		d.tr.Logits(s, traceCandidates(probs[i]))
++	} else {
++		d.tr.Logits(s, nil)
++	}
++	if ps, ok := d.pendingSample[s]; ok {
++		delete(d.pendingSample, s)
++		d.tr.Forward("decode.sample", ps.body, ps.tns)
++	} else {
++		if eos && s == target && chosen < 0 {
++			chosen = d.eosID
++		}
++		method := "dist"
++		if d.opts.Temperature <= 0 {
++			method = "greedy"
++		}
++		d.tr.Sample(s, chosen, f32(d.opts.Temperature), f32(d.opts.TopP), d.opts.TopK, method)
++	}
++	d.completed = s
++}
++
++// drainTraceLine collects the trace fields of the chunks llama-server sends after
++// the one that finished an OpenAI-compatible chat stream (the final array's
++// later chunks carry the last events).
++func drainTraceLine(line []byte, into *runnerTraceChunk) {
++	if len(line) == 0 || line[0] == ':' {
++		return
++	}
++	evt, ok := bytes.CutPrefix(line, []byte("data: "))
++	if !ok {
++		evt = line
++	}
++	if bytes.Equal(evt, []byte("[DONE]")) || !bytes.Contains(evt, []byte("__trace")) {
++		return
++	}
++	var c runnerTraceChunk
++	if err := json.Unmarshal(evt, &c); err == nil {
++		into.merge(c)
++	}
++}
+diff --git a/llm/llama_server_runner_trace_test.go b/llm/llama_server_runner_trace_test.go
+new file mode 100644
+index 00000000..faa0dbdb
+--- /dev/null
++++ b/llm/llama_server_runner_trace_test.go
+@@ -0,0 +1,612 @@
++package llm
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/coder/websocket"
++	"golang.org/x/sync/semaphore"
++
++	"github.com/ollama/ollama/api"
++	"github.com/ollama/ollama/trace"
++)
++
++// ---- test hub: the visualizer side of the trace socket ----------------------
++
++type testHub struct {
++	srv *httptest.Server
++
++	mu     sync.Mutex
++	conn   *websocket.Conn
++	events map[string][]map[string]any
++	notify chan struct{}
++	onEv   map[string]func(ev map[string]any) // per req
++}
++
++var (
++	hubOnce sync.Once
++	hub     *testHub
++)
++
++// traceTestHub starts one hub for the test binary (the emitter is a process
++// singleton configured from OLLAMA_TRACE_URL) and waits until Ollama's side
++// is connected.
++func traceTestHub(t *testing.T) *testHub {
++	t.Helper()
++	hubOnce.Do(func() {
++		h := &testHub{events: map[string][]map[string]any{}, notify: make(chan struct{}, 1), onEv: map[string]func(map[string]any){}}
++		h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			c, err := websocket.Accept(w, r, nil)
++			if err != nil {
++				return
++			}
++			c.SetReadLimit(64 << 20)
++			h.mu.Lock()
++			h.conn = c
++			h.mu.Unlock()
++			for {
++				_, data, err := c.Read(context.Background())
++				if err != nil {
++					return
++				}
++				for line := range bytes.SplitSeq(data, []byte("\n")) {
++					var ev map[string]any
++					if json.Unmarshal(line, &ev) != nil {
++						continue
++					}
++					req, _ := ev["req"].(string)
++					h.mu.Lock()
++					h.events[req] = append(h.events[req], ev)
++					cb := h.onEv[req]
++					h.mu.Unlock()
++					if cb != nil {
++						cb(ev)
++					}
++					select {
++					case h.notify <- struct{}{}:
++					default:
++					}
++				}
++			}
++		}))
++		os.Setenv("OLLAMA_TRACE_URL", "ws"+strings.TrimPrefix(h.srv.URL, "http")+"/ingest")
++		trace.Init()
++		hub = h
++	})
++	probe := trace.NewRequest("hub-probe", "", "")
++	for i := 0; !probe.HubConnected(); i++ {
++		if i > 500 {
++			t.Fatal("trace hub never connected")
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	return hub
++}
++
++func (h *testHub) ack(req string, cont bool) {
++	h.mu.Lock()
++	c := h.conn
++	h.mu.Unlock()
++	msg := fmt.Sprintf(`{"v":1,"type":"ack","req":%q,"continue":%v}`, req, cont)
++	c.Write(context.Background(), websocket.MessageText, []byte(msg))
++}
++
++// wait returns the events of req once request.done has arrived.
++func (h *testHub) wait(t *testing.T, req string) []map[string]any {
++	t.Helper()
++	deadline := time.After(5 * time.Second)
++	for {
++		h.mu.Lock()
++		evs := h.events[req]
++		h.mu.Unlock()
++		if len(evs) > 0 && evs[len(evs)-1]["type"] == "request.done" {
++			return evs
++		}
++		select {
++		case <-h.notify:
++		case <-time.After(10 * time.Millisecond):
++		case <-deadline:
++			t.Fatalf("no request.done for %s; got %d events", req, len(evs))
++		}
++	}
++}
++
++// ---- fake llama-server ------------------------------------------------------
++
++type fakeLlamaServer struct {
++	t       *testing.T
++	patched bool
++	stream  func(w io.Writer, flush func(), acks <-chan map[string]any)
++
++	mu      sync.Mutex
++	body    []byte // last completion request body
++	acks    []map[string]any
++	ackCh   chan map[string]any
++	probeOK bool
++}
++
++func newFakeLlamaServer(t *testing.T, patched bool, stream func(w io.Writer, flush func(), acks <-chan map[string]any)) (*fakeLlamaServer, *llamaServerRunner) {
++	f := &fakeLlamaServer{t: t, patched: patched, stream: stream, ackCh: make(chan map[string]any, 64)}
++	srv := httptest.NewServer(f)
++	t.Cleanup(srv.Close)
++	var port int
++	fmt.Sscanf(srv.URL[strings.LastIndex(srv.URL, ":")+1:], "%d", &port)
++	return f, &llamaServerRunner{
++		port:    port,
++		cmd:     fakeRunningCmd(),
++		sem:     semaphore.NewWeighted(1),
++		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
++	}
++}
++
++func (f *fakeLlamaServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	switch r.URL.Path {
++	case "/health":
++		fmt.Fprint(w, `{"status":"ok"}`)
++	case "/tokenize":
++		fmt.Fprint(w, `{"tokens":[{"id":1,"piece":"Hi"}]}`)
++	case "/apply-template":
++		fmt.Fprint(w, `{"prompt":"rendered"}`)
++	case "/trace/ack":
++		if !f.patched {
++			http.NotFound(w, r)
++			return
++		}
++		var body map[string]any
++		json.NewDecoder(r.Body).Decode(&body)
++		if body["id_slot"] == float64(2147483647) {
++			w.WriteHeader(http.StatusConflict)
++			fmt.Fprint(w, `{"ok":false,"error":"no request in step mode"}`)
++			return
++		}
++		f.mu.Lock()
++		f.acks = append(f.acks, body)
++		f.mu.Unlock()
++		f.ackCh <- body
++		fmt.Fprint(w, `{"ok":true}`)
++	case "/completion", "/v1/chat/completions":
++		body, _ := io.ReadAll(r.Body)
++		f.mu.Lock()
++		f.body = body
++		f.mu.Unlock()
++		w.Header().Set("Content-Type", "text/event-stream")
++		fl, _ := w.(http.Flusher)
++		f.stream(w, func() { fl.Flush() }, f.ackCh)
++	default:
++		f.t.Errorf("unexpected path %s", r.URL.Path)
++	}
++}
++
++func (f *fakeLlamaServer) traceField() map[string]any {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	var req map[string]any
++	if err := json.Unmarshal(f.body, &req); err != nil {
++		f.t.Fatalf("bad request body %s", f.body)
++	}
++	tr, _ := req["trace"].(map[string]any)
++	return tr
++}
++
++func sse(w io.Writer, flush func(), chunks ...string) {
++	for _, c := range chunks {
++		fmt.Fprintf(w, "data: %s\n\n", c)
++	}
++	flush()
++}
++
++// tracedCompletion runs a /completion request through runner with a tracer
++// in the context, emitting decode.token like server/ does.
++func tracedCompletion(t *testing.T, r *llamaServerRunner, req, detail, step string) []map[string]any {
++	t.Helper()
++	tr := trace.NewRequest(req, detail, step)
++	tr.SetRunnerPatched(true)
++	tr.Received("m", 2, nil)
++	ctx := trace.NewContext(t.Context(), tr)
++	opts := api.DefaultOptions()
++	opts.Temperature = 0.8
++	err := r.Completion(ctx, CompletionRequest{Prompt: "Hi", Options: &opts}, func(cr CompletionResponse) {
++		tr.Token(ctx, cr.Content, cr.Done)
++	})
++	if err != nil {
++		t.Fatalf("Completion: %v", err)
++	}
++	tr.End(true, "")
++	return hub.wait(t, req)
++}
++
++func countTypes(evs []map[string]any) map[string]int {
++	c := map[string]int{}
++	for _, e := range evs {
++		c[e["type"].(string)]++
++	}
++	return c
++}
++
++func checkEnvelope(t *testing.T, evs []map[string]any) {
++	t.Helper()
++	var lastT float64
++	for i, e := range evs {
++		if e["seq"] != float64(i) {
++			t.Fatalf("event %d has seq %v", i, e["seq"])
++		}
++		tns := e["t_ns"].(float64)
++		if tns < lastT {
++			t.Fatalf("t_ns goes backwards at seq %d (%s)", i, e["type"])
++		}
++		lastT = tns
++		if e["v"] != float64(1) {
++			t.Fatalf("event %d without v:1", i)
++		}
++	}
++}
++
++// ---- tests ------------------------------------------------------------------
++
++func TestParseRunnerEvent(t *testing.T) {
++	ev, err := parseRunnerEvent(json.RawMessage(`{"type":"decode.layer","t_ns":123456789012,"step":2,"layer":3,"ms":1.5,"device":"CUDA0"}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ev.typ != "decode.layer" || ev.tns != 123456789012 || ev.step != 1 {
++		t.Fatalf("got %+v", ev)
++	}
++	var body map[string]any
++	json.Unmarshal(ev.body, &body)
++	if _, ok := body["type"]; ok {
++		t.Error("type left in body")
++	}
++	if _, ok := body["t_ns"]; ok {
++		t.Error("t_ns left in body")
++	}
++	if body["step"] != float64(1) || body["layer"] != float64(3) || body["device"] != "CUDA0" {
++		t.Errorf("body = %s", ev.body)
++	}
++
++	ev, err = parseRunnerEvent(json.RawMessage(`{"type":"prefill.batch","t_ns":5,"batch_i":0,"of":1,"from":0,"to":4,"ms":2}`))
++	if err != nil || ev.step != -1 {
++		t.Fatalf("prefill: %+v %v", ev, err)
++	}
++	if _, err := parseRunnerEvent(json.RawMessage(`{"t_ns":5}`)); err == nil {
++		t.Error("event without type accepted")
++	}
++}
++
++func TestRunnerTraceClockOffset(t *testing.T) {
++	d := &traceDecode{}
++	if got := d.rebase(10); got != -1 {
++		t.Fatalf("rebase before any chunk = %d, want -1 (now)", got)
++	}
++	d.observeClock(5_000, 1_000) // offset 4000
++	if got := d.rebase(900); got != 4_900 {
++		t.Fatalf("rebase = %d, want 4900", got)
++	}
++	d.observeClock(9_000, 2_000) // offset 7000: slower delivery, ignored
++	if got := d.rebase(900); got != 4_900 {
++		t.Fatalf("larger offset replaced the smaller one: %d", got)
++	}
++	d.observeClock(9_500, 6_000) // offset 3500: kept
++	if got := d.rebase(900); got != 4_400 {
++		t.Fatalf("rebase = %d, want 4400", got)
++	}
++}
++
++// A full-detail /completion stream: prefill events out of t_ns order, a
++// trace-only chunk, forward-pass events per step and llama-server's own
++// decode.sample, which replaces the synthesized one.
++func TestRunnerTraceCompletionFull(t *testing.T) {
++	h := traceTestHub(t)
++	const T = int64(1_000_000_000)
++	ts := func(d int64) int64 { return T + d }
++	f, r := newFakeLlamaServer(t, true, func(w io.Writer, flush func(), _ <-chan map[string]any) {
++		sse(w, flush,
++			fmt.Sprintf(`{"content":"Hi","stop":false,"timings":{"cache_n":0,"prompt_n":4,"prompt_ms":2,"predicted_n":1,"predicted_ms":1},`+
++				`"completion_probabilities":[{"id":5,"token":"Hi","logprob":-0.1,"top_logprobs":[{"id":5,"token":"Hi","logprob":-0.1}]}],`+
++				`"__trace_t_ns":%d,"__trace_caps":[],"__trace_slot":0,"__trace":[`+
++				`{"type":"prefill.layer","t_ns":%d,"batch_i":0,"layer":0,"ms":0.1},`+
++				`{"type":"prefill.layer","t_ns":%d,"batch_i":1,"layer":0,"ms":0.1},`+
++				`{"type":"prefill.batch","t_ns":%d,"batch_i":0,"of":2,"from":0,"to":2,"ms":1},`+
++				`{"type":"prefill.batch","t_ns":%d,"batch_i":1,"of":2,"from":2,"to":4,"ms":1},`+
++				`{"type":"prefill.done","t_ns":%d,"n_tokens":4,"ms":2},`+
++				`{"type":"decode.sample.stage","t_ns":%d,"step":1,"stage":"raw","candidates":[{"id":5,"v":3}],"cutoff":100},`+
++				`{"type":"decode.sample","t_ns":%d,"step":1,"chosen_id":77,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}]}`,
++				ts(10_000), ts(100), ts(2_000), ts(50), ts(1_900), ts(2_100), ts(2_200), ts(2_300)),
++			fmt.Sprintf(`{"content":"","tokens":[],"stop":false,"__trace_t_ns":%d,"__trace":[`+
++				`{"type":"decode.layer","t_ns":%d,"step":2,"layer":0,"ms":0.5,"device":"CUDA0","norm":1.5},`+
++				`{"type":"decode.op","t_ns":%d,"step":2,"layer":0,"op":"norm","ms":0.1}]}`, ts(20_000), ts(19_000), ts(19_100)),
++			fmt.Sprintf(`{"content":" there","stop":false,"timings":{"predicted_n":2,"predicted_ms":2},`+
++				`"completion_probabilities":[{"id":6,"token":" there","logprob":-0.2,"top_logprobs":[{"id":6,"token":" there","logprob":-0.2}]}],`+
++				`"__trace_t_ns":%d,"__trace":[`+
++				`{"type":"decode.layer","t_ns":%d,"step":2,"layer":1,"ms":0.5,"device":"CUDA0","norm":1.6},`+
++				`{"type":"decode.sample","t_ns":%d,"step":2,"chosen_id":78,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}]}`, ts(30_000), ts(29_000), ts(29_500)),
++			fmt.Sprintf(`{"content":"","stop":true,"stop_type":"eos","timings":{"cache_n":0,"prompt_n":4,"prompt_ms":2,"predicted_n":3,"predicted_ms":3},`+
++				`"__trace_t_ns":%d,"__trace":[{"type":"decode.sample","t_ns":%d,"step":3,"chosen_id":128009,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}]}`, ts(40_000), ts(39_000)),
++		)
++	})
++
++	evs := tracedCompletion(t, r, "rt-full", "full", "")
++	checkEnvelope(t, evs)
++
++	tr := f.traceField()
++	if tr == nil || tr["detail"] != "full" || tr["layer_stride"] != float64(4) || tr["attn_layers"] != float64(4) || tr["attn_heads"] != false {
++		t.Fatalf("trace request = %v", tr)
++	}
++	if _, ok := tr["step"]; ok {
++		t.Errorf("step sent without step mode: %v", tr)
++	}
++
++	c := countTypes(evs)
++	want := map[string]int{
++		"request.received": 1, "tokenize.done": 1, "prefill.layer": 2, "prefill.batch": 2, "prefill.done": 1,
++		"decode.step.start": 3, "decode.sample.stage": 1, "decode.logits": 3, "decode.sample": 3,
++		"decode.layer": 2, "decode.op": 1, "decode.token": 3, "stream.chunk": 2, "request.done": 1,
++	}
++	for k, v := range want {
++		if c[k] != v {
++			t.Errorf("%s: got %d, want %d (all: %v)", k, c[k], v, c)
++		}
++	}
++
++	// prefill.batch is sorted into time order, and t_ns differences inside a
++	// chunk survive the rebase.
++	var order []string
++	var tLayer0, tLayer1 float64
++	chosen := map[float64]float64{}
++	step := -1.0
++	for _, e := range evs {
++		switch e["type"] {
++		case "prefill.layer", "prefill.batch", "prefill.done":
++			order = append(order, fmt.Sprintf("%s%v", e["type"], e["batch_i"]))
++			if e["type"] == "prefill.layer" && e["batch_i"] == float64(0) {
++				tLayer0 = e["t_ns"].(float64)
++			}
++			if e["type"] == "prefill.layer" && e["batch_i"] == float64(1) {
++				tLayer1 = e["t_ns"].(float64)
++			}
++		case "decode.step.start":
++			step = e["step"].(float64)
++		case "decode.sample":
++			chosen[e["step"].(float64)] = e["chosen_id"].(float64)
++		}
++		if s, ok := e["step"].(float64); ok && s > step {
++			t.Errorf("%s for step %v before its decode.step.start", e["type"], s)
++		}
++	}
++	if got := strings.Join(order, ","); got != "prefill.batch0,prefill.layer0,prefill.batch1,prefill.layer1,prefill.done<nil>" {
++		t.Errorf("prefill order = %s", got)
++	}
++	if d := tLayer1 - tLayer0; d != 1_900 {
++		t.Errorf("rebased prefill.layer gap = %v ns, want 1900", d)
++	}
++	if chosen[0] != 77 || chosen[1] != 78 || chosen[2] != 128009 {
++		t.Errorf("decode.sample chosen = %v, want llama-server's 77/78/128009", chosen)
++	}
++	for _, e := range evs {
++		if e["type"] == "decode.layer" && e["step"] != float64(1) {
++			t.Errorf("decode.layer step %v, want 1 (llama-server step 2)", e["step"])
++		}
++		if e["type"] == "decode.token" && e["step"] == float64(2) && e["is_eos"] != true {
++			t.Errorf("EOS step token = %v", e)
++		}
++		if e["type"] == "request.received" {
++			if caps := fmt.Sprint(e["capabilities"]); strings.Contains(caps, "no_layers") {
++				t.Errorf("capabilities = %s", caps)
++			}
++		}
++	}
++	_ = h
++}
++
++// At layers detail, full-tier runner events are not forwarded.
++func TestRunnerTraceLayersFiltersFullTier(t *testing.T) {
++	traceTestHub(t)
++	f, r := newFakeLlamaServer(t, true, func(w io.Writer, flush func(), _ <-chan map[string]any) {
++		sse(w, flush,
++			`{"content":"A","stop":false,"timings":{"predicted_n":1},"__trace_t_ns":100,"__trace":[{"type":"prefill.done","t_ns":10,"n_tokens":1,"ms":1},{"type":"decode.sample","t_ns":20,"step":1,"chosen_id":1,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}]}`,
++			`{"content":"B","stop":false,"timings":{"predicted_n":2},"__trace_t_ns":200,"__trace":[`+
++				`{"type":"decode.layer","t_ns":150,"step":2,"layer":0,"ms":0.5},`+
++				`{"type":"decode.op","t_ns":151,"step":2,"layer":0,"op":"norm","ms":0.1},`+
++				`{"type":"decode.attn","t_ns":152,"step":2,"layer":0,"top":[{"pos":0,"w":1}]},`+
++				`{"type":"decode.sample.stage","t_ns":153,"step":2,"stage":"raw","candidates":[]},`+
++				`{"type":"not.a.type","t_ns":154,"step":2},`+
++				`{"type":"decode.sample","t_ns":160,"step":2,"chosen_id":2,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}]}`,
++			`{"content":"","stop":true,"stop_type":"limit","timings":{"predicted_n":2}}`,
++		)
++	})
++	evs := tracedCompletion(t, r, "rt-layers", "layers", "")
++	checkEnvelope(t, evs)
++	if f.traceField()["detail"] != "layers" {
++		t.Errorf("trace = %v", f.traceField())
++	}
++	c := countTypes(evs)
++	for _, typ := range []string{"decode.op", "decode.attn", "decode.sample.stage", "not.a.type", "stream.chunk"} {
++		if c[typ] != 0 {
++			t.Errorf("%s forwarded at layers detail", typ)
++		}
++	}
++	if c["decode.layer"] != 1 || c["decode.sample"] != 2 || c["decode.step.start"] != 2 {
++		t.Errorf("counts %v", c)
++	}
++}
++
++// Without runner tracing (basic detail, a stock runner or tracing disabled)
++// the llama-server request has no trace field.
++func TestRunnerTraceNotRequested(t *testing.T) {
++	traceTestHub(t)
++	plain := func(w io.Writer, flush func(), _ <-chan map[string]any) {
++		sse(w, flush, `{"content":"A","stop":false,"timings":{"predicted_n":1}}`, `{"content":"","stop":true,"stop_type":"eos","timings":{"predicted_n":2}}`)
++	}
++
++	f, r := newFakeLlamaServer(t, true, plain)
++	evs := tracedCompletion(t, r, "rt-basic", "basic", "")
++	if bytes.Contains(f.body, []byte(`"trace"`)) {
++		t.Errorf("basic detail sent trace: %s", f.body)
++	}
++	if c := countTypes(evs); c["prefill.batch"] != 1 || c["decode.sample"] != 2 {
++		t.Errorf("basic counts %v", c)
++	}
++
++	// A stock runner falls back to the token gate, so the hub acks tokens.
++	hub.mu.Lock()
++	hub.onEv["rt-stock"] = func(ev map[string]any) {
++		if ev["type"] == "request.received" || ev["type"] == "decode.step.start" {
++			go hub.ack("rt-stock", false)
++		}
++	}
++	hub.mu.Unlock()
++	f, r = newFakeLlamaServer(t, false, plain)
++	tracedCompletion(t, r, "rt-stock", "full", "layer")
++	if bytes.Contains(f.body, []byte(`"trace"`)) {
++		t.Errorf("stock runner got trace: %s", f.body)
++	}
++
++	f, r = newFakeLlamaServer(t, true, plain)
++	opts := api.DefaultOptions()
++	if err := r.Completion(t.Context(), CompletionRequest{Prompt: "Hi", Options: &opts}, func(CompletionResponse) {}); err != nil {
++		t.Fatal(err)
++	}
++	if bytes.Contains(f.body, []byte(`"trace"`)) || bytes.Contains(f.body, []byte(`timings_per_token`)) {
++		t.Errorf("untraced request changed: %s", f.body)
++	}
++}
++
++// Layer step mode: llama-server pauses, the trace-only chunk's events reach
++// the hub before the pause ends, the hub's ack is forwarded to POST
++// /trace/ack, and the end of the request sends continue.
++func TestRunnerTraceLayerStepForwardsAcks(t *testing.T) {
++	h := traceTestHub(t)
++	const req = "rt-step"
++	h.mu.Lock()
++	h.onEv[req] = func(ev map[string]any) {
++		if ev["type"] == "decode.layer" {
++			go h.ack(req, false)
++		}
++	}
++	h.mu.Unlock()
++
++	f, r := newFakeLlamaServer(t, true, func(w io.Writer, flush func(), acks <-chan map[string]any) {
++		sse(w, flush, `{"content":"A","stop":false,"timings":{"predicted_n":1},"__trace_t_ns":100,"__trace_slot":3,"__trace_caps":[],"__trace":[{"type":"prefill.done","t_ns":10,"n_tokens":1,"ms":1}]}`)
++		for layer := range 2 {
++			sse(w, flush, fmt.Sprintf(`{"content":"","tokens":[],"stop":false,"__trace_t_ns":%d,"__trace":[{"type":"decode.layer","t_ns":%d,"step":2,"layer":%d,"ms":0.5}]}`, 200+layer, 150+layer, layer))
++			select {
++			case a := <-acks:
++				if a["continue"] == true {
++					t.Errorf("pause %d released by continue", layer)
++				}
++			case <-time.After(3 * time.Second):
++				t.Errorf("no ack forwarded for pause %d", layer)
++				return
++			}
++		}
++		sse(w, flush, `{"content":"B","stop":false,"timings":{"predicted_n":2}}`, `{"content":"","stop":true,"stop_type":"limit","timings":{"predicted_n":2}}`)
++	})
++	evs := tracedCompletion(t, r, req, "basic", "layer")
++	checkEnvelope(t, evs)
++
++	tr := f.traceField()
++	if tr["step"] != "layer" || tr["detail"] != "layers" || tr["step_timeout_ms"] == nil {
++		t.Errorf("trace request = %v", tr)
++	}
++	if c := countTypes(evs); c["decode.layer"] != 2 || c["decode.step.start"] != 2 {
++		t.Errorf("counts %v", c)
++	}
++	f.mu.Lock()
++	acks := append([]map[string]any(nil), f.acks...)
++	f.mu.Unlock()
++	if len(acks) != 3 {
++		t.Fatalf("acks = %v, want 2 acks and a final continue", acks)
++	}
++	for i, a := range acks {
++		if a["id_slot"] != float64(3) {
++			t.Errorf("ack %d id_slot = %v, want 3", i, a["id_slot"])
++		}
++	}
++	if acks[2]["continue"] != true {
++		t.Errorf("last ack = %v, want continue", acks[2])
++	}
++}
++
++// A visualizer "continue" is forwarded as-is.
++func TestRunnerTraceContinueForwarded(t *testing.T) {
++	h := traceTestHub(t)
++	const req = "rt-continue"
++	h.mu.Lock()
++	h.onEv[req] = func(ev map[string]any) {
++		if ev["type"] == "decode.layer" {
++			go h.ack(req, true)
++		}
++	}
++	h.mu.Unlock()
++	f, r := newFakeLlamaServer(t, true, func(w io.Writer, flush func(), acks <-chan map[string]any) {
++		sse(w, flush, `{"content":"A","stop":false,"timings":{"predicted_n":1},"__trace_t_ns":100,"__trace_slot":0,"__trace":[{"type":"decode.layer","t_ns":50,"step":2,"layer":0,"ms":0.5}]}`)
++		select {
++		case a := <-acks:
++			if a["continue"] != true {
++				t.Errorf("ack = %v, want continue", a)
++			}
++		case <-time.After(3 * time.Second):
++			t.Error("continue not forwarded")
++		}
++		sse(w, flush, `{"content":"","stop":true,"stop_type":"limit","timings":{"predicted_n":1}}`)
++	})
++	tracedCompletion(t, r, req, "layers", "layer")
++	f.mu.Lock()
++	n := len(f.acks)
++	f.mu.Unlock()
++	if n != 2 { // the visualizer's continue, then the end-of-request continue
++		t.Errorf("acks = %d, want 2", n)
++	}
++}
++
++// Native chat: a chunk with "choices":[] that only carries __trace, and the
++// last events on a chunk after the finish_reason chunk.
++func TestRunnerTraceChatChunks(t *testing.T) {
++	h := traceTestHub(t)
++	_, r := newFakeLlamaServer(t, true, func(w io.Writer, flush func(), _ <-chan map[string]any) {
++		sse(w, flush,
++			`{"choices":[{"delta":{"content":"Hi"},"logprobs":{"content":[{"id":5,"token":"Hi","logprob":-0.1,"top_logprobs":[]}]}}],"timings":{"predicted_n":1},"__trace_t_ns":100,"__trace_slot":0,"__trace_caps":["no_attn"],"__trace":[{"type":"prefill.batch","t_ns":10,"batch_i":0,"of":1,"from":0,"to":3,"ms":1},{"type":"prefill.done","t_ns":11,"n_tokens":3,"ms":1},{"type":"decode.sample","t_ns":20,"step":1,"chosen_id":5,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}]}`,
++			`{"choices":[],"object":"chat.completion.chunk","__trace_t_ns":200,"__trace":[{"type":"decode.layer","t_ns":150,"step":2,"layer":0,"ms":0.5},{"type":"decode.sample","t_ns":160,"step":2,"chosen_id":128009,"temp":0.8,"top_p":0.9,"top_k":40,"method":"dist"}]}`,
++			`{"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"predicted_n":2,"predicted_ms":2}}`,
++			`{"choices":[],"usage":{},"__trace_t_ns":300,"__trace":[{"type":"decode.residual","t_ns":170,"step":2,"layer":0,"norm":1,"delta_norm":0.5}]}`,
++			`[DONE]`,
++		)
++	})
++	tr := trace.NewRequest("rt-chat", "full", "")
++	tr.SetRunnerPatched(true)
++	tr.Received("m", 2, nil)
++	ctx := trace.NewContext(t.Context(), tr)
++	opts := api.DefaultOptions()
++	var text string
++	err := r.Chat(ctx, ChatRequest{Messages: []api.Message{{Role: "user", Content: "hi"}}, Options: &opts}, func(cr ChatResponse) {
++		text += cr.Message.Content
++		tr.Token(ctx, cr.Message.Content, cr.Done)
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	tr.End(true, "")
++	evs := h.wait(t, "rt-chat")
++	checkEnvelope(t, evs)
++	c := countTypes(evs)
++	if text != "Hi" || c["decode.step.start"] != 2 || c["decode.sample"] != 2 || c["decode.layer"] != 1 || c["decode.residual"] != 1 || c["prefill.batch"] != 1 {
++		t.Errorf("text %q counts %v", text, c)
++	}
++	for _, e := range evs {
++		if e["type"] == "decode.sample" && e["step"] == float64(1) && e["chosen_id"] != float64(128009) {
++			t.Errorf("EOS sample = %v", e)
++		}
++		if e["type"] == "decode.token" && e["step"] == float64(1) && e["is_eos"] != true {
++			t.Errorf("EOS token = %v", e)
++		}
++	}
++}
+diff --git a/llm/llama_server_trace.go b/llm/llama_server_trace.go
+index 7e43f98e..3a306058 100644
+--- a/llm/llama_server_trace.go
++++ b/llm/llama_server_trace.go
+@@ -10,6 +10,7 @@ import (
+ 	"math"
+ 	"net/http"
+ 	"strconv"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/ollama/ollama/api"
+@@ -33,6 +34,17 @@ type traceDecode struct {
+ 	prefilled   bool
+ 	promptTotal int
+ 	generated   int
++
++	// Runner events (llama-server with the visualizer trace patch).
++	native        bool  // the request asked llama-server for trace events
++	offset        int64 // tracer clock minus llama-server clock
++	hasOffset     bool
++	slot          atomic.Int32
++	capsSeen      bool
++	realPrefill   bool
++	prefillTo     int
++	completed     int // last step with decode.logits and decode.sample
++	pendingSample map[int]runnerSample
+ }
+ 
+ func (s *llamaServerRunner) newTraceDecode(ctx context.Context, opts *api.Options) *traceDecode {
+@@ -46,7 +58,9 @@ func (s *llamaServerRunner) newTraceDecode(ctx context.Context, opts *api.Option
+ 			eos = int(v)
+ 		}
+ 	}
+-	return &traceDecode{tr: tr, opts: opts, kvTotal: s.options.NumCtx, eosID: eos, tokenized: -1}
++	d := &traceDecode{tr: tr, opts: opts, kvTotal: s.options.NumCtx, eosID: eos, tokenized: -1, completed: -1, pendingSample: map[int]runnerSample{}}
++	d.slot.Store(-1)
++	return d
+ }
+ 
+ // tokenize emits tokenize.done for the exact prompt sent to llama-server.
+-- 
+2.47.1.windows.2
+

@@ -125,8 +125,13 @@ export class Player implements ClockSource {
   }
   consume(e: TraceEvent, wall: number, skip: boolean) {
     this.cursor++;
-    if (!skip) this.machine.apply(e, wall);
+    if (skip) this.skipped++;
+    else this.machine.apply(e, wall);
   }
+
+  /** full-detail events skipped while degraded (fast-forwarding) */
+  skipped = 0;
+  private rebuilt = false;
   headT() {
     return this.lastT;
   }
@@ -152,6 +157,15 @@ export class Player implements ClockSource {
 
   tick(now: number): ViewModel {
     this.clock.tick(now, this);
+    // A live Full-detail run that had to fast-forward skipped its detail
+    // events. Once it has finished playing, rebuild the final state from the
+    // whole buffer so the last step's forward pass and sampler chain show.
+    if (!this.rebuilt && this.skipped > 0 && this.done && this.atEnd) {
+      this.rebuilt = true;
+      const live = this.clock.live;
+      this.seek(this.lastT);
+      this.clock.live = live;
+    }
     return this.snapshot();
   }
 

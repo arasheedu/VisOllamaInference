@@ -24,7 +24,11 @@ test('Run against mock Ollama (public API + trace socket): reaches Done, text ma
     },
   });
   try {
-    await expect(page.locator('[data-testid=model] option')).toHaveCount(3, { timeout: 15_000 });
+    await expect(
+      page.locator('[data-testid=model] option', { hasText: 'mock-llama:1b' }),
+    ).toHaveCount(1, {
+      timeout: 15_000,
+    });
     await page.selectOption('[data-testid=model]', 'mock-llama:1b');
     await page.click('[data-testid=run]');
     await expect(page.locator('[data-testid=pipeline]')).toHaveAttribute('data-phase', 'done', {

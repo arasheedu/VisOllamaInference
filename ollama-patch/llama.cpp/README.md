@@ -96,9 +96,11 @@ collected since the previous chunk:
 - `/v1/responses` and `/v1/messages` (Anthropic) are not instrumented. Events are collected but not
   attached.
 
-**Step numbering** matches the Go tracer: `step` is the 1-based index of the generated token.
+**Step numbering:** `step` is the 1-based index of the generated token.
 The forward pass that produced token *s*'s logits belongs to step *s*. Token 1 comes from the
-prefill, so `decode.layer` starts at step 2. `prefill.*` events have no `step`.
+prefill, so `decode.layer` starts at step 2. `prefill.*` events have no `step`. The Go tracer and
+the app count steps from 0, so Ollama subtracts 1 from every forwarded `step`. As a result, Ollama
+traces have `decode.layer` from step 1 (see `ollama-patch/NOTES.md`).
 
 **Ordering.** `prefill.batch` events are held back until the prefill finishes, because `of` is
 only known then. They come right before `prefill.done`, after the `prefill.layer` events of all

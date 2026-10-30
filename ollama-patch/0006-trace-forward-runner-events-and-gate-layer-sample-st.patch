@@ -1,0 +1,505 @@
+From cf37dc0466f07f6c61c15373575c07c87dc5fdb7 Mon Sep 17 00:00:00 2001
+From: Rasheed <arasheedu@gmail.com>
+Date: Thu, 29 Oct 2026 16:46:51 -0700
+Subject: [PATCH 06/10] trace: forward runner events and gate layer/sample
+ steps in llama-server
+
+Adds the API llm uses to pass on events a patched llama-server produces:
+Forward (detail-filtered against the schema's EVENT_DETAIL), StepStartAt,
+Now and the runner capability flag that request.received reports.
+
+t_ns is now assigned under a per-request lock and never goes backwards in
+seq order, so rebased runner timestamps cannot reorder the stream.
+
+In layer/sample step mode the Go token gate is off and acks are queued for
+llama-server's POST /trace/ack instead; DisableRunnerStep falls back to the
+token gate for a stock runner.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ trace/runner.go      | 153 +++++++++++++++++++++++++++++++++++++++++++
+ trace/runner_test.go | 152 ++++++++++++++++++++++++++++++++++++++++++
+ trace/tracer.go      |  77 ++++++++++++++++++----
+ 3 files changed, 369 insertions(+), 13 deletions(-)
+ create mode 100644 trace/runner.go
+ create mode 100644 trace/runner_test.go
+
+diff --git a/trace/runner.go b/trace/runner.go
+new file mode 100644
+index 00000000..3d636adf
+--- /dev/null
++++ b/trace/runner.go
+@@ -0,0 +1,153 @@
++package trace
++
++import (
++	"context"
++	"time"
++)
++
++// runnerAckCap bounds acks buffered for llama-server step mode (layer and
++// sample granularity) before they are posted to the runner.
++const runnerAckCap = 1024
++
++// eventDetail mirrors EVENT_DETAIL in packages/trace-schema: the minimum
++// detail level at which each event type is emitted. Types not listed are
++// unknown to the schema and are never forwarded.
++var eventDetail = map[string]Detail{
++	"request.received":    Basic,
++	"model.load":          Basic,
++	"tokenize.done":       Basic,
++	"prefill.batch":       Basic,
++	"prefill.done":        Basic,
++	"decode.step.start":   Basic,
++	"decode.logits":       Basic,
++	"decode.sample":       Basic,
++	"decode.token":        Basic,
++	"request.done":        Basic,
++	"request.error":       Basic,
++	"step.timeout":        Basic,
++	"decode.layer":        Layers,
++	"tokenize.merge":      Full,
++	"prefill.layer":       Full,
++	"decode.op":           Full,
++	"decode.residual":     Full,
++	"decode.attn":         Full,
++	"decode.kv.write":     Full,
++	"decode.sample.stage": Full,
++	"stream.chunk":        Full,
++	"decode.moe":          Full,
++}
++
++// SetRunnerPatched records whether the llama-server behind this request has
++// the visualizer trace patch. Call it before Received: it decides the
++// capabilities reported there.
++func (t *RequestTracer) SetRunnerPatched(patched bool) {
++	if t != nil {
++		t.runnerPatched = patched
++	}
++}
++
++// RunnerStep returns "layer" or "sample" when this request holds step mode
++// at a granularity that llama-server gates itself, else "".
++func (t *RequestTracer) RunnerStep() string {
++	if t == nil || t.runnerAcks == nil {
++		return ""
++	}
++	return t.stepReq
++}
++
++// WantsRunnerTrace reports whether llama-server should be asked for its own
++// trace events: at layers/full detail, or for layer/sample step mode.
++func (t *RequestTracer) WantsRunnerTrace() bool {
++	return t != nil && (t.detail >= Layers || t.RunnerStep() != "")
++}
++
++// Allowed reports whether a runner event of type typ is forwarded at this
++// request's detail level. Step mode at layer (sample) granularity also lets
++// decode.layer (decode.sample.stage) through, since those are what the
++// runner pauses on.
++func (t *RequestTracer) Allowed(typ string) bool {
++	if t == nil {
++		return false
++	}
++	d, ok := eventDetail[typ]
++	if !ok {
++		return false
++	}
++	if d <= t.detail {
++		return true
++	}
++	switch t.RunnerStep() {
++	case "layer":
++		return typ == "decode.layer"
++	case "sample":
++		return typ == "decode.sample.stage"
++	}
++	return false
++}
++
++// Now returns the tracer clock (ns since the emitter started), the time base
++// of every t_ns.
++func (t *RequestTracer) Now() int64 {
++	if t == nil {
++		return 0
++	}
++	return time.Since(t.e.base).Nanoseconds()
++}
++
++// Forward emits an event produced by llama-server. body is its payload as a
++// JSON object without v/req/seq/t_ns/type; tns is already on the tracer
++// clock. Events not allowed at this detail level are dropped.
++func (t *RequestTracer) Forward(typ string, body []byte, tns int64) {
++	if t == nil || !t.Allowed(typ) || len(body) < 2 || body[0] != '{' {
++		return
++	}
++	t.emitBody(typ, body, tns)
++}
++
++// StepStartAt is StepStart with an explicit t_ns (tracer clock, < 0 = now),
++// used when llama-server reports when the step's forward pass began.
++func (t *RequestTracer) StepStartAt(ctx context.Context, kvUsed, kvTotal int, tns int64) int {
++	if t == nil {
++		return 0
++	}
++	return t.stepStartAt(ctx, kvUsed, kvTotal, tns)
++}
++
++// CurrentStep returns the current decode step, -1 before the first.
++func (t *RequestTracer) CurrentStep() int {
++	if t == nil {
++		return -1
++	}
++	return t.step
++}
++
++// RunnerAcks returns the acks to pass on to llama-server's POST /trace/ack
++// (true = continue), or nil when the runner does not gate this request.
++func (t *RequestTracer) RunnerAcks() <-chan bool {
++	if t == nil || !t.runnerStepping.Load() {
++		return nil
++	}
++	return t.runnerAcks
++}
++
++// DisableRunnerStep falls back to the Go token gate, for a runner that turned
++// out not to support step mode. Acks already received count as one token.
++func (t *RequestTracer) DisableRunnerStep() {
++	if t == nil || !t.runnerStepping.CompareAndSwap(true, false) {
++		return
++	}
++	for {
++		select {
++		case cont := <-t.runnerAcks:
++			t.ack(cont)
++		default:
++			return
++		}
++	}
++}
++
++// HubConnected reports whether the visualizer socket is up. Step mode never
++// waits for acks while it is down.
++func (t *RequestTracer) HubConnected() bool {
++	return t != nil && t.e.connected.Load()
++}
+diff --git a/trace/runner_test.go b/trace/runner_test.go
+new file mode 100644
+index 00000000..7a8a736b
+--- /dev/null
++++ b/trace/runner_test.go
+@@ -0,0 +1,152 @@
++package trace
++
++import (
++	"context"
++	"slices"
++	"testing"
++	"time"
++)
++
++func TestCapabilitiesWithPatchedRunner(t *testing.T) {
++	e := testEmitter(t)
++	for _, tc := range []struct {
++		detail, step string
++		patched      bool
++		want         []string
++	}{
++		{"full", "", true, []string{"no_tokenize_merge"}},
++		{"layers", "", true, []string{"no_tokenize_merge"}},
++		{"basic", "", true, []string{"no_tokenize_merge", "prefill_synthesized"}},
++		{"basic", "layer", true, []string{"no_tokenize_merge"}},
++		{"full", "", false, []string{"no_layers", "no_ops", "no_residual", "no_attn", "no_kv_writes", "no_sample_stages", "no_tokenize_merge", "prefill_synthesized"}},
++		{"full", "sample", false, []string{"no_layers", "no_ops", "no_residual", "no_attn", "no_kv_writes", "no_sample_stages", "no_tokenize_merge", "prefill_synthesized", "step_token_only"}},
++	} {
++		tr := e.newRequest("caps-"+tc.detail+tc.step, tc.detail, tc.step)
++		tr.SetRunnerPatched(tc.patched)
++		if got := tr.Capabilities(); !slices.Equal(got, tc.want) {
++			t.Errorf("%s/%s patched=%v: %v, want %v", tc.detail, tc.step, tc.patched, got, tc.want)
++		}
++		tr.End(true, "")
++		drain(e)
++	}
++}
++
++func TestAllowedFollowsDetail(t *testing.T) {
++	e := testEmitter(t)
++	layers := e.newRequest("a1", "layers", "")
++	full := e.newRequest("a2", "full", "")
++	for typ, want := range map[string][2]bool{
++		"decode.sample":       {true, true},
++		"prefill.batch":       {true, true},
++		"step.timeout":        {true, true},
++		"decode.layer":        {true, true},
++		"decode.op":           {false, true},
++		"decode.attn":         {false, true},
++		"decode.sample.stage": {false, true},
++		"decode.moe":          {false, true},
++		"bogus":               {false, false},
++	} {
++		if got := [2]bool{layers.Allowed(typ), full.Allowed(typ)}; got != want {
++			t.Errorf("%s: layers/full = %v, want %v", typ, got, want)
++		}
++	}
++
++	// Step mode lets through what the runner pauses on.
++	sample := e.newRequest("a3", "layers", "sample")
++	if !sample.Allowed("decode.sample.stage") || sample.Allowed("decode.op") {
++		t.Error("sample step at layers detail")
++	}
++	sample.End(true, "")
++	layer := e.newRequest("a4", "basic", "layer")
++	if !layer.Allowed("decode.layer") || layer.Allowed("decode.op") || !layer.WantsRunnerTrace() {
++		t.Error("layer step at basic detail")
++	}
++	layer.End(true, "")
++	if e.newRequest("a5", "basic", "").WantsRunnerTrace() {
++		t.Error("basic detail wants runner trace")
++	}
++}
++
++func TestForwardKeepsTimeOrder(t *testing.T) {
++	e := testEmitter(t)
++	e.base = time.Now().Add(-time.Second) // so t0+20 is not in the future on a coarse clock
++	tr := e.newRequest("fwd", "full", "")
++	ctx := context.Background()
++	t0 := tr.Now() - 1_000_000 // 1 ms ago: rebased runner times are in the past
++	tr.Forward("decode.layer", []byte(`{"step":0,"layer":0,"ms":1}`), t0)
++	tr.StepStartAt(ctx, 1, 10, t0+10)
++	tr.Forward("decode.layer", []byte(`{"step":0,"layer":1,"ms":1}`), t0+20)
++	tr.Forward("decode.op", []byte(`{"step":0,"layer":1,"op":"norm","ms":1}`), t0+15) // earlier than previous: clamped
++	tr.Forward("decode.layer", []byte(`{"step":0,"layer":2,"ms":1}`), tr.Now()+int64(time.Hour))
++	tr.Forward("decode.layer", []byte(`not an object`), t0)
++	tr.Forward("not.a.type", []byte(`{"step":0}`), t0)
++
++	evs := drain(e)
++	if len(evs) != 5 {
++		t.Fatalf("got %d events: %v", len(evs), evs)
++	}
++	var last float64
++	for i, ev := range evs {
++		if ev["seq"] != float64(i) {
++			t.Errorf("seq %v at %d", ev["seq"], i)
++		}
++		ts := ev["t_ns"].(float64)
++		if ts < last {
++			t.Errorf("t_ns backwards at %d", i)
++		}
++		last = ts
++	}
++	if evs[0]["t_ns"].(float64) != float64(t0) {
++		t.Errorf("first t_ns = %v, want %d", evs[0]["t_ns"], t0)
++	}
++	if evs[2]["t_ns"].(float64) != float64(t0+20) || evs[3]["t_ns"].(float64) != float64(t0+20) {
++		t.Errorf("rebased t_ns = %v, %v; want %d twice", evs[2]["t_ns"], evs[3]["t_ns"], t0+20)
++	}
++	if evs[4]["t_ns"].(float64) > float64(tr.Now()) {
++		t.Error("t_ns in the future")
++	}
++}
++
++func TestRunnerStepAcks(t *testing.T) {
++	e := testEmitter(t)
++	e.connected.Store(true)
++	tr := e.newRequest("rs", "full", "layer")
++	if tr.RunnerStep() != "layer" || tr.RunnerAcks() == nil {
++		t.Fatal("layer step not gated by the runner")
++	}
++	// The Go token gate is off: StepStart does not wait.
++	done := make(chan struct{})
++	go func() { tr.StepStart(context.Background(), 0, 0); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(500 * time.Millisecond):
++		t.Fatal("token gate applied in layer step mode")
++	}
++	e.handleControl([]byte(`{"v":1,"type":"ack","req":"rs","granularity":"layer"}`))
++	e.handleControl([]byte(`{"v":1,"type":"ack","req":"rs","continue":true}`))
++	acks := tr.RunnerAcks()
++	if a := <-acks; a {
++		t.Error("first ack is a continue")
++	}
++	if a := <-acks; !a {
++		t.Error("continue not passed on")
++	}
++	tr.End(true, "")
++
++	// A runner without step support: back to the token gate, and an ack
++	// that arrived meanwhile counts as one token.
++	tr = e.newRequest("rs2", "full", "sample")
++	e.handleControl([]byte(`{"v":1,"type":"ack","req":"rs2"}`))
++	tr.DisableRunnerStep()
++	if tr.RunnerAcks() != nil {
++		t.Error("runner acks after DisableRunnerStep")
++	}
++	done = make(chan struct{})
++	go func() { tr.StepStart(context.Background(), 0, 0); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(500 * time.Millisecond):
++		t.Fatal("buffered ack did not release the token gate")
++	}
++	tr.End(true, "")
++}
+diff --git a/trace/tracer.go b/trace/tracer.go
+index 69190658..d49d3cae 100644
+--- a/trace/tracer.go
++++ b/trace/tracer.go
+@@ -7,6 +7,7 @@ import (
+ 	"math"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 	"unicode/utf8"
+@@ -65,12 +66,21 @@ type RequestTracer struct {
+ 	reqJSON []byte
+ 	detail  Detail
+ 	stepReq string
+-	seq     atomic.Int64
++
++	mu    sync.Mutex // orders seq, t_ns and enqueue
++	seq   int64
++	lastT int64
+ 
+ 	stepping atomic.Bool
+ 	ackCh    chan struct{}
+-	finished atomic.Bool
+-	start    time.Time
++
++	// Layer/sample step mode is gated inside llama-server: acks are passed
++	// on through runnerAcks (true = continue) instead of the token gate.
++	runnerStepping atomic.Bool
++	runnerAcks     chan bool
++	runnerPatched  bool
++	finished       atomic.Bool
++	start          time.Time
+ 
+ 	step      int // current decode step, -1 before the first
+ 	tokenSent bool
+@@ -106,6 +116,10 @@ func (e *emitter) newRequest(id, detail, step string) *RequestTracer {
+ 		if e.stepOwner.CompareAndSwap(nil, t) {
+ 			t.ackCh = make(chan struct{}, 1)
+ 			t.stepping.Store(true)
++			if t.stepReq == "layer" || t.stepReq == "sample" {
++				t.runnerAcks = make(chan bool, runnerAckCap)
++				t.runnerStepping.Store(true)
++			}
+ 			e.waiters.Store(id, t)
+ 		} else {
+ 			slog.Warn("trace step mode already in use by another request; running freely", "req", id)
+@@ -158,8 +172,24 @@ func (t *RequestTracer) emit(typ string, payload any) {
+ 		slog.Debug("trace marshal failed", "type", typ, "error", err)
+ 		return
+ 	}
+-	seq := t.seq.Add(1) - 1
+-	tns := time.Since(t.e.base).Nanoseconds()
++	t.emitBody(typ, body, -1)
++}
++
++// emitBody emits a marshalled payload object. tns < 0 means now. t_ns never
++// goes backwards in seq order and never runs ahead of the clock.
++func (t *RequestTracer) emitBody(typ string, body []byte, tns int64) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	now := time.Since(t.e.base).Nanoseconds()
++	if tns < 0 || tns > now {
++		tns = now
++	}
++	if tns < t.lastT {
++		tns = t.lastT
++	}
++	t.lastT = tns
++	seq := t.seq
++	t.seq++
+ 
+ 	buf := make([]byte, 0, 64+len(t.reqJSON)+len(typ)+len(body))
+ 	buf = append(buf, `{"v":1,"req":`...)
+@@ -289,9 +319,16 @@ type stepTimeout struct {
+ // ---- events ---------------------------------------------------------------
+ 
+ // Capabilities lists what this emitter cannot provide. Everything below the
+-// HTTP boundary of llama-server needs a patched llama.cpp (see
+-// ollama-patch/NOTES.md).
++// HTTP boundary of llama-server needs the visualizer patch in llama.cpp (see
++// ollama-patch/NOTES.md); SetRunnerPatched says whether it is there.
+ func (t *RequestTracer) Capabilities() []string {
++	if t != nil && t.runnerPatched {
++		caps := []string{"no_tokenize_merge"}
++		if !t.WantsRunnerTrace() {
++			caps = append(caps, "prefill_synthesized")
++		}
++		return caps
++	}
+ 	caps := []string{
+ 		"no_layers", "no_ops", "no_residual", "no_attn", "no_kv_writes",
+ 		"no_sample_stages", "no_tokenize_merge", "prefill_synthesized",
+@@ -365,21 +402,27 @@ func (t *RequestTracer) StepStart(ctx context.Context, kvUsed, kvTotal int) int
+ 	if t == nil {
+ 		return 0
+ 	}
+-	t.closeStep()
++	return t.stepStartAt(ctx, kvUsed, kvTotal, -1)
++}
++
++func (t *RequestTracer) stepStartAt(ctx context.Context, kvUsed, kvTotal int, tns int64) int {
++	t.closeStep(tns)
+ 	next := t.step + 1
+ 	t.waitStep(ctx, next)
+ 	t.step = next
+ 	t.tokenSent = false
+ 	t.eos = false
+-	t.emit("decode.step.start", decodeStepStart{Step: next, KVUsed: max(kvUsed, 0), KVTotal: max(kvTotal, 0)})
++	body, _ := json.Marshal(decodeStepStart{Step: next, KVUsed: max(kvUsed, 0), KVTotal: max(kvTotal, 0)})
++	t.emitBody("decode.step.start", body, tns)
+ 	return next
+ }
+ 
+ // closeStep gives a step whose text the response parser held back an empty
+ // decode.token so every step has one.
+-func (t *RequestTracer) closeStep() {
++func (t *RequestTracer) closeStep(tns int64) {
+ 	if t.step >= 0 && !t.tokenSent {
+-		t.emit("decode.token", decodeToken{Step: t.step, Text: "", IsEOS: false})
++		body, _ := json.Marshal(decodeToken{Step: t.step, Text: "", IsEOS: false})
++		t.emitBody("decode.token", body, tns)
+ 		t.tokenSent = true
+ 	}
+ }
+@@ -445,7 +488,7 @@ func (t *RequestTracer) Done(s Stats) {
+ 	if t == nil || !t.finished.CompareAndSwap(false, true) {
+ 		return
+ 	}
+-	t.closeStep()
++	t.closeStep(-1)
+ 	t.emit("request.done", requestDone{Stats: s})
+ }
+ 
+@@ -476,7 +519,7 @@ func (t *RequestTracer) End(ok bool, msg string) {
+ }
+ 
+ func (t *RequestTracer) waitStep(ctx context.Context, step int) {
+-	if !t.stepping.Load() || !t.e.connected.Load() {
++	if !t.stepping.Load() || t.runnerStepping.Load() || !t.e.connected.Load() {
+ 		return
+ 	}
+ 	timer := time.NewTimer(t.e.cfg.stepTimeout)
+@@ -493,6 +536,14 @@ func (t *RequestTracer) ack(cont bool) {
+ 	if cont {
+ 		t.stepping.Store(false)
+ 	}
++	if t.runnerStepping.Load() {
++		select {
++		case t.runnerAcks <- cont:
++		default:
++			slog.Debug("trace: runner ack queue full, ack dropped", "req", t.req)
++		}
++		return
++	}
+ 	select {
+ 	case t.ackCh <- struct{}{}:
+ 	default:
+-- 
+2.47.1.windows.2
+

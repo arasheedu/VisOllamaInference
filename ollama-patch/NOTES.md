@@ -1,210 +1,213 @@
 # Ollama instrumentation notes
 
 Checkout: `ollama/` at v0.40.13 + 2 commits (`8861adaa`), `LLAMA_CPP_VERSION = b11963`, `go.mod` requires Go 1.26.10.
+Branch `visualizer-trace` adds 10 commits (`00*.patch`). Build and run instructions are in `build.md`.
+The llama.cpp side is described in `llama.cpp/README.md`.
 
 ## Architecture (differs from the original plan)
 
 - There is **no `runner/`, no Go `ollamarunner`, no `ml/backend/ggml`, no `sample/`**. No Go-native GGML engine remains.
 - Every GGUF model runs in an **upstream llama.cpp `llama-server` subprocess**. Ollama talks to it over HTTP on `127.0.0.1:<random port>`.
 - `mlxrunner/` is a Go-native MLX engine, used only for MLX-format models. It is not relevant here.
-- llama.cpp is **not vendored**. `llama/server/CMakeLists.txt` uses FetchContent at configure time (`GIT_TAG` from `LLAMA_CPP_VERSION`) and applies `llama/compat/*.patch`. You can point it at a local source tree with `OLLAMA_LLAMA_CPP_SOURCE`, which skips the compat patches, or with `-DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=...`, which keeps them.
+- llama.cpp is **not vendored**. The root CMake project clones it (`GIT_TAG` from `LLAMA_CPP_VERSION`) and applies `llama/compat/*.patch` with `cmake/apply-git-patches.cmake`. Our llama.cpp change is carried there as `llama/compat/100-visualizer-trace.patch`.
 
 ## Hook points (Go side)
 
 | Concern | Location |
 |---|---|
-| Route registration | `server/routes.go:2427` (`/api/generate`), `:2428` (`/api/chat`) |
-| Header access / middleware pattern | `server/inference_request_log.go:49` (`withInferenceRequestLogging`) |
-| GenerateHandler / ChatHandler entry | `routes.go:308` / `routes.go:3019` (`checkpointStart`) |
-| Model scheduling (load) | `scheduleRunnerForModel` `routes.go:257`; `Scheduler.load` `server/sched.go:539`; spawn `llm.NewLlamaServer` `sched.go:622`; `llama.Load` `sched.go:672` |
-| Load finished | `checkpointLoaded` `routes.go:560` (generate), `:3239` (chat) |
-| llama-server spawn / flags | `llm/llama_server.go:375–480` |
-| Rendered path → `POST /completion` | `llamaServerRunner.Completion` `llama_server.go:1667`; request struct `:1450` (has `n_probs`, unused `timings_per_token`) |
-| Per-token callback (completion) | `llama_server.go:1856`; final timings `:1868` |
-| Native chat path → `POST /v1/chat/completions` | `llamaServerRunner.Chat` `llama_server.go:2038`; request map `:2291`; stream parse `:2112–2198` |
-| Logprobs | `NProbs = max(TopLogprobs,1)` `:1718`; `completion_probabilities` struct `:1659` (ids/bytes not unmarshalled) |
-| Timings | `llamaServerTimings` `:1639` (`cache_n, prompt_n, prompt_ms, predicted_n, predicted_ms`) |
-| Total/load duration | `routes.go:803`, `:3373`, `:3540` |
-| Tokenize | `r.Tokenize` → llama-server `POST /tokenize` `llama_server.go:2656–2742`; upstream supports `with_pieces: true` |
-| Streaming to client | `streamResponse` `routes.go:2625`; `writeChatResponse` `routes.go:2966` |
+| Route registration | `server/routes.go` (`/api/generate`, `/api/chat`) |
+| Header access / middleware pattern | `server/inference_request_log.go` (`withInferenceRequestLogging`) |
+| GenerateHandler / ChatHandler entry | `startTrace` right after the body is bound |
+| Model scheduling (load) | `scheduleRunnerForModel`; `Scheduler.load` `server/sched.go`; spawn `llm.NewLlamaServer` |
+| llama-server spawn / flags | `llm/llama_server.go` `startLlamaServer` |
+| Rendered path → `POST /completion` | `llamaServerRunner.Completion`; request struct `llamaServerCompletionRequest` (now with `Trace`) |
+| Native chat path → `POST /v1/chat/completions` | `llamaServerRunner.Chat` (used when the model has no Go template, a renderer/parser, or `OLLAMA_GO_TEMPLATE=false`) |
+| Runner trace protocol | `llm/llama_server_runner_trace.go` (request object, probe, chunk forwarding, ack forwarding) |
+| Basic-tier decode events | `llm/llama_server_trace.go` |
+| Tokenize | `r.Tokenize` → llama-server `POST /tokenize` with `with_pieces: true` |
+| Streaming to client | `streamResponse`; `writeChatResponse` |
 
-## Event feasibility
+## What is real and what is synthesised
 
-| Event | Go-only patch (stock llama-server) | Needs patched llama.cpp |
+With the native payload from `build.md` (patched llama-server) and a request at `layers`/`full` detail
+or in `layer`/`sample` step mode:
+
+| Event | Source | Notes |
 |---|---|---|
-| request.received, model.load, request.done, request.error | ✅ routes.go / sched.go | |
-| tokenize.done | ✅ via `/tokenize` with `with_pieces` on the rendered prompt | |
-| prefill.batch / prefill.done | ⚠️ synthesized: one batch, duration from `timings.prompt_ms` (first-token latency) | real ubatch loop: `tools/server` slot loop |
-| decode.step.start, decode.token | ✅ per streamed piece; kv_used = prompt_n + step | |
-| decode.logits | ✅ from `n_probs` / `top_logprobs` (up to 20) | |
-| decode.sample | ✅ params from request options; chosen = streamed token | |
-| decode.layer, decode.op, prefill.layer | ❌ | `ggml_backend_sched_set_eval_callback` in `src/llama-context.cpp` |
-| decode.residual, decode.attn, decode.kv.write | ❌ | eval callback + tensor readback |
-| decode.sample.stage | ❌ | sampler chain `src/llama-sampling.cpp`, `common/sampling.cpp` |
-| stream.chunk | ✅ in the Go streaming callback | |
-| Step mode (token granularity) | ✅ block in Go per-token callback; llama-server keeps generating into the HTTP stream buffer. TCP backpressure eventually stalls it. | layer/sample granularity needs C++ |
+| `request.received`, `model.load`, `request.done`, `request.error` | Go (`server/`) | unchanged |
+| `tokenize.done` | Go: llama-server `/tokenize` with `with_pieces` on the exact prompt | unchanged |
+| `prefill.batch`, `prefill.done` | **llama-server**, one `prefill.batch` per real ubatch | the synthesised single batch is used only when llama-server sent neither |
+| `prefill.layer` | **llama-server** (`full`) | |
+| `decode.step.start` | Go, one per generated token | `t_ns` = first runner event of the step; `kv_used` = prompt tokens + step |
+| `decode.layer` (`device`, `norm` at full) | **llama-server** | every step < 8, then every `OLLAMA_TRACE_LAYER_STRIDE`-th (default 4) |
+| `decode.op`, `decode.residual`, `decode.kv.write`, `decode.attn`, `decode.moe` | **llama-server** (`full`) | attention on every `OLLAMA_TRACE_ATTN_LAYERS`-th layer (default 4), heads averaged unless `OLLAMA_TRACE_ATTN_HEADS` |
+| `decode.sample.stage` | **llama-server** (`full`, or `sample` step mode) | the real chain in llama.cpp order, e.g. `raw → top_k → top_p → temperature → softmax → draw` for Ollama's defaults (penalties, DRY, min-p 0 etc. are no-ops and not emitted) |
+| `decode.sample` | **llama-server** | real `chosen_id` and `method`; `temp`/`top_p` rounded from float32 (0.8, not 0.800000011920929). Go synthesises it only for a step llama-server sent none for. |
+| `decode.logits` | Go: `n_probs` / `top_logprobs` (top 10) | still the pre-sampling distribution from llama-server's probabilities |
+| `decode.token`, `stream.chunk` | Go (`server/`, after Ollama's parsers) | unchanged |
+| `step.timeout` | Go (token gate) or **llama-server** (layer/sample pauses) | |
+| `tokenize.merge` | not produced | left to the app (`no_tokenize_merge`) |
 
-## Build prerequisites (Windows)
+At `basic` detail, with tracing off, or with a stock llama-server, nothing changes from the Go-only
+tier (below). The llama-server request then has no `trace` field.
 
-The C++ payload build needs Go 1.26.10, CMake ≥ 3.24, Visual Studio 2022 C++ tools (Native Desktop), and Ninja. Use `cmake -B build . && cmake --build build --parallel 8`.
+### How runner events are forwarded (`llm/llama_server_runner_trace.go`)
 
-For Go-only changes, `go build .` produces `ollama.exe`, which reuses an existing native payload. `FindLlamaServer` searches `<exe dir>\lib\ollama` (`llm/llama_binary.go:50–146`). The stock install ships `lib\ollama\llama-server.exe` plus `libllama-server-impl.dll`.
+- **Detection.** `request.received` is sent before a runner is scheduled, so its capabilities come from
+  `llm.RunnerTraceSupported()`. That is the cached result of the last runner probe, or, before
+  the first one, a scan of `llama-server*.exe/dll` for the protocol's `__trace_caps` marker. Each
+  runner is then probed once, the first time a request wants runner events: `POST /trace/ack
+  {"id_slot":2147483647}`. A patched server answers 409 (no such slot in step mode; this never
+  counts as an ack), and a stock one 404. On a stock runner the request runs untraced on the
+  llama.cpp side and layer/sample step mode falls back to the Go token gate.
+- **Request.** `trace: {detail: "layers"|"full", layer_stride, attn_layers, attn_heads[, step, step_timeout_ms]}`
+  is added to `/completion` and `/v1/chat/completions` requests. Basic-detail requests with layer
+  step mode send `detail: "layers"`.
+- **Chunks.** `__trace`, `__trace_t_ns`, `__trace_caps` and `__trace_slot` are parsed from every SSE chunk,
+  including `/completion` trace-only chunks (`content:""`, `tokens:[]`), which also skip the
+  token-repeat check, and chat chunks with `choices:[]`. On the chat path, the chunks after the
+  `finish_reason` chunk (the rest of llama-server's final array) are drained for their events
+  before the last step is closed.
+- **Steps.** llama-server counts steps from 1, while the tracer and the app count from 0. Every runner
+  `step` is decremented. The tracer starts one step per generated token, driven by the
+  runner events and `timings.predicted_n`. Earlier, steps were per stream chunk, and a chunk with
+  held-back text could cover several tokens. Now the two always line up, and the extra steps get an
+  empty `decode.token`, as before. This only happens when runner events are forwarded; the basic
+  tier keeps one step per chunk.
+- **Order and time.** Events within a chunk are sorted by `t_ns`, because `prefill.batch` is held back
+  by llama-server. They are rebased with `offset = go_receive_ns − __trace_t_ns`, keeping
+  the smallest offset seen in the request. The tracer assigns `seq` and `t_ns` under a lock and clamps
+  `t_ns` so it never goes backwards in `seq` order and never lies in the future.
+- **De-duplication.** Real `prefill.*` replaces the synthesised batch. Per step, the runner's
+  `decode.sample` is held until the step's token arrives, so the order is
+  `decode.step.start → forward-pass events → sampler stages → decode.logits → decode.sample → decode.token`,
+  with exactly one `decode.logits` and one `decode.sample` per step. A grammar resample's second
+  `raw…draw` sequence is passed through.
+- **Detail filtering.** `layers` forwards `decode.layer` and the basic-tier types and drops the
+  full-tier ones. `full` forwards everything the schema knows; unknown types are dropped. In
+  step mode, `layer` also lets `decode.layer` through and `sample` lets `decode.sample.stage` through,
+  since those are the events the runner pauses on.
+- **`__trace_caps`** (e.g. `no_attn`, `no_sample_stages`, `no_step`) is logged
+  (`llama-server trace capabilities missing`); the schema has no later capabilities event.
+  `no_step` (another request holds llama-server's step gate) switches the request back to the Go
+  token gate.
 
-## Implementation (branch `visualizer-trace`, 3 commits, see `*.patch`)
+### Step mode
 
-| Commit | Files |
+| `X-Trace-Step` | Gate | Ack path |
+|---|---|---|
+| `token` (`1`, `true`, …) | Go, before each `decode.step.start` (unchanged). llama-server keeps generating into the HTTP stream. | hub ack → tracer |
+| `layer`, `sample` (patched runner) | llama-server, after every layer's `l_out` / every sampler stage. Stride is forced to 1. | hub ack → tracer → `POST /trace/ack {"id_slot":<__trace_slot>}` (`continue:true` passed on) |
+
+- Before each pause, llama-server sends a trace-only chunk. Its events go out right away, so the app
+  sees layer *n* while llama-server waits for the ack for layer *n*. There is no Go token gate in
+  this mode.
+- Ollama sends `{"continue":true}` when the request ends (before closing the stream), when the client
+  goes away, or when the visualizer socket drops (checked every 250 ms), so llama-server is never
+  left waiting. Its own `step_timeout_ms` (`OLLAMA_TRACE_STEP_TIMEOUT`) and client-disconnect
+  detection are the last line of defence. Step mode is only requested while the hub is connected.
+- Only one request holds step mode (the Go owner and llama-server's gate). Acks that arrive before
+  llama-server's first pause count as credits there.
+
+### Capabilities in `request.received`
+
+| Runner | Capabilities |
 |---|---|
-| `trace: add env-gated inference trace emitter` | `trace/emitter.go` (transport), `trace/tracer.go` (per-request API + payload structs), `trace/trace_test.go`, `envconfig/config.go` (4 vars), `go.mod` (+`github.com/coder/websocket v1.8.15`, no transitive deps) |
-| `llm: emit decode trace events from the llama-server stream` | `llm/llama_server_trace.go` (new), `llm/llama_server.go` (+~45 lines in `Completion` / `Chat`, `id` added to `llamaServerTokenProb`) |
-| `server: trace chat and generate requests` | `server/trace.go` (new), `server/routes.go` (+~35 lines) |
+| patched, `layers`/`full` or layer/sample step | `["no_tokenize_merge"]` |
+| patched, `basic` | `["no_tokenize_merge","prefill_synthesized"]` |
+| stock | `["no_layers","no_ops","no_residual","no_attn","no_kv_writes","no_sample_stages","no_tokenize_merge","prefill_synthesized"]` (+ `"step_token_only"` for layer/sample step) |
+
+## Verification (native CUDA build, RTX 4060, llama3.2 3B Q4_K_M)
+
+- Rendered (`/completion`) and native (`/v1/chat/completions`, `OLLAMA_GO_TEMPLATE=false`) chat and
+  `/api/generate` at `full`, `layers` and `basic`: every event passes `parseEvent`, `seq` is contiguous,
+  `t_ns` monotonic, every step has `decode.step.start` before its other events and exactly one
+  `decode.logits` + `decode.sample`, and concat(`decode.token`) equals the response. `basic` sends no
+  `trace` field (unit test, plus live counts identical to the Go-only tier).
+- Layer step mode with a scripted hub: 140 layer pauses acked (5 steps × 28), 2.6 s; with no acks,
+  `step.timeout` per pause, and a client disconnect releases llama-server; hub disconnect → continue.
+  Sample step mode at `layers` detail: 6 stages × 5 steps acked.
+- In the Electron app (`e2e/probe-real.ts`, plus a scratch probe for replay screenshots and
+  `stepGranularity: 'layer'`), capabilities are `["no_tokenize_merge"]` and there are no mismatch
+  warnings. Replay shows real per-op timings, residual bars, attention arcs and the llama.cpp
+  sampler chain. In layer step mode, each *Step layer* click advances exactly one layer.
+- Recorded: `traces/real/llama3.2-chat-sky-full.ndjson` (8,100 events, 81 steps) and
+  `traces/real/llama3.2-chat-copper-full.ndjson` (7,438 events, 73 steps), each with its
+  `.response.txt`. 0 schema errors.
+- Unit tests: `trace/runner_test.go` (capabilities, filtering, t_ns clamp, ack routing),
+  `llm/llama_server_runner_trace_test.go` (fake llama-server + real WebSocket hub: chunk parsing,
+  step shift, offset rebasing, de-dup, layers filtering, no `trace` at basic/stock/untraced, chat
+  `choices:[]` and final array, ack and continue forwarding).
+
+## Go-only tier (stock llama-server, or `basic` detail)
 
 ### Emitter (`trace/`)
 
 - `trace.NewRequest(id, detail, step)` returns `nil` when `OLLAMA_TRACE_URL` is unset. Every
   `*RequestTracer` method starts with `if t == nil { return }`. `testing.AllocsPerRun` checks that the disabled path makes 0 allocations.
-  The only per-request cost when tracing is off is one `ctx.Value` lookup at each hook.
 - One ordered queue (`chan []byte`, cap 10 000) and one writer goroutine that owns the socket.
   When the queue is full, **droppable** events are counted and dropped. **Critical** events (same split as
-  `PRIORITY` in trace-schema) go to an overflow list instead. Once the overflow is non-empty, all new events go
-  there too until it drains, so order is preserved. The overflow is capped at 200 000 events as a memory guard. Callers never block.
-- The writer batches up to 256 queued events into one newline-delimited text frame. If a write
-  fails, it keeps the batch and resends it after reconnecting. Reconnect uses backoff from 250 ms to 5 s. Only the first
-  failure is logged. When the hub has been unreachable for more than 5 s, queued events are discarded,
-  so a missing app cannot cause unbounded growth or a stale flood later.
-- A reader goroutine parses `ack` lines (single or NDJSON) and wakes the matching step-mode request.
-- `t_ns` is `time.Since(processStart)`, which is monotonic. **On Windows its resolution is coarse.** The events of
-  one decode step often share a `t_ns` value, and so do prefill.* and step 0. Order by `seq`, which is contiguous from 0 per `req`.
-- The JSON envelope is built by hand (`{"v":1,"req":…,"seq":…,"t_ns":…,"type":…`) and payload
-  structs are spliced in. Field names are pinned by `TestSchemaFieldNames`. Every recorded event passes `parseEvent`.
+  `PRIORITY` in trace-schema) go to an overflow list instead (capped at 200 000). Callers never block.
+- The writer batches up to 256 queued events into one newline-delimited text frame and resends a batch after
+  reconnecting (250 ms → 5 s backoff). When the hub has been unreachable for more than 5 s, queued events are discarded.
+- A reader goroutine parses `ack` lines and wakes the matching step-mode request, or queues the ack for llama-server.
+- `t_ns` is the tracer clock (`time.Since(processStart)`). On Windows its resolution is coarse, so order by `seq`.
 
-### Where each event comes from
+### Where the basic-tier events come from
 
 | Event | Emitted in | Source of data |
 |---|---|---|
-| `request.received` | `ChatHandler` / `GenerateHandler` right after the body is bound (`startTrace`) | `model`; `prompt_chars` = runes of prompt / all message contents; `options` = the request's raw `options` map; `detail`; static `capabilities` |
-| `model.load` start/done | `scheduleRunnerForModel` around `sched.getRunner` | `layers` = GGUF `<arch>.block_count`; `ctx` = requested `num_ctx` (0 = auto) on start, `ContextLength()` on done; `vram_mb` = `MemorySize()` VRAM on done (0 on start); `ms` = scheduling wall time (≈0–3 ms when already loaded) |
-| `tokenize.done` | `llm` before the completion request | `POST /tokenize {content, add_special:true, with_pieces:true}` on the exact prompt sent to `/completion`. On the native path, `/apply-template` runs first. Skipped for multimodal prompts. |
-| `prefill.batch` + `prefill.done` | `llm`, on the first streamed chunk | One synthesized batch: `from` = `cache_n`, `to` = `cache_n+prompt_n`, `ms` = `prompt_ms` (from `timings_per_token`). Falls back to tokenize count + first-chunk latency. |
-| `decode.step.start` | `llm`, per streamed llama-server chunk (and for the EOS token) | `kv_used` = prompt tokens + `predicted_n` before this chunk, `kv_total` = `num_ctx` |
-| `decode.logits` | same | `top_logprobs` of the chunk's first token (n_probs = max(client, 10)), `p = exp(logprob)` from the **pre-sampling** distribution; `entropy` in nats over the top-10 only |
-| `decode.sample` | same | `chosen_id` = token id llama-server reports (`-1` if unknown; GGUF `eos_token_id` for the EOS step); `temp/top_p/top_k` from resolved options; `method` = `greedy` if temp ≤ 0 else `dist` |
-| `decode.token` | `server`, immediately before each chunk is sent to the client (`traceChunk`) | `text` = `thinking + content` **after** Ollama's parsers; `is_eos` on the final chunk when llama-server stopped on EOS (`stop_type:"eos"` / `finish_reason:"stop"`) |
-| `stream.chunk` | same, detail = `full` only | `bytes` = UTF-8 length of the chunk text, `utf8_complete` = `utf8.ValidString` (always true; llama-server never splits code points in content) |
-| `request.done` | final chunk (`traceChunk`); fallback in a deferred `endTrace` | Response metrics in ms. The fallback (e.g. `done_reason:"load"` with an empty prompt) carries only `total_ms`. |
-| `request.error` | `streamResponse` / non-stream loops / `handleScheduleError`; fallback `endTrace` | Error text sent to the client, or `request failed with HTTP status N` / `request canceled` |
-| `step.timeout` | `RequestTracer.StepStart` | `granularity:"token"` |
+| `request.received` | `ChatHandler` / `GenerateHandler` (`startTrace`) | `model`, `prompt_chars`, raw `options`, `detail`, `capabilities` (table above) |
+| `model.load` start/done | `scheduleRunnerForModel` | GGUF `block_count`, `num_ctx` / `ContextLength()`, VRAM, scheduling wall time |
+| `tokenize.done` | `llm` before the completion request | `/tokenize` with `with_pieces`; native path renders with `/apply-template` first; skipped for multimodal prompts |
+| `prefill.batch` + `prefill.done` (synthesised) | `llm`, first streamed chunk | one batch `cache_n…cache_n+prompt_n`, `ms` = `prompt_ms` |
+| `decode.step.start` | `llm`, per streamed chunk (+ EOS) | `kv_used` = prompt tokens + `predicted_n` before the chunk |
+| `decode.logits` | same | `top_logprobs` of the chunk's first token, `p = exp(logprob)`, entropy over the top 10 |
+| `decode.sample` (synthesised) | same | `chosen_id` = reported token id; `temp/top_p/top_k` from options; `method` greedy/dist |
+| `decode.token` / `stream.chunk` | `server` (`traceChunk`) | post-parser text; `stream.chunk` at `full` only |
+| `request.done` / `request.error` | final chunk / error paths / `endTrace` fallback | |
 
-Client isolation: tracing always asks llama-server for logprobs. The `userLogprobs` function drops them unless
-the client set `logprobs`, and truncates `top_logprobs` to the client's value. Verified live: traced responses contain
-no `logprobs` unless requested, and `top_logprobs:3` returns exactly 3 (unit test `TestUserLogprobsHidesTraceProbs`).
+Response-text invariant: `concat(decode.token.text)` == `concat(thinking + content)` of the streamed response.
+The app must include `thinking`. Text that the parsers turn into `tool_calls` doesn't appear.
 
-### Response-text invariant
-
-`concat(decode.token.text)` == `concat(message.thinking + message.content)` over the streamed chunks
-(`response`/`thinking` for `/api/generate`). This was verified on every recorded run: rendered and native chat,
-generate, a thinking model through the builtin parser, emoji (multi-token chunks), and `stream:false`.
-**The app must include `thinking`** in its comparison. Text Ollama's parsers turn into structured
-`tool_calls` does not appear in `decode.token`, and neither do `<think>` tags the parser strips.
-
-Granularity caveats:
-- A step is one llama-server **stream chunk**, which is normally one token. When llama-server holds text back
-  (incomplete UTF-8, partial stop-string match), one chunk carries several tokens. `kv_used` then
-  jumps by more than 1, and logits/sample describe the chunk's *first* token only (llama-server reports
-  one probability entry for the held-back run; its `token` text can be `"�"` for byte tokens).
-  So `#steps ≤ eval_count`.
-- While a parser buffers (e.g. `<think>`), that step gets `decode.token` with `text:""`. The buffered
-  text arrives with a later step. Every step has ≥ 1 `decode.token`. Rarely, a final flush adds a
-  second `decode.token` to the last step, so the app should concatenate in `seq` order.
-- The EOS step has an empty `topk` (llama-server sends no probabilities for it) and `text:""`, `is_eos:true`.
-  Requests that stop on `num_predict` or a stop word have no EOS step and no `is_eos:true`.
-
-### Step mode
-
-- Enabled by `X-Trace-Step` (any value except empty/`0`/`false`/`off`) or `OLLAMA_TRACE_STEP`.
-  Only one request at a time holds step mode (an atomic owner). Others run freely and log a warning.
-- Before each `decode.step.start` the request blocks until (a) an `ack` for its `req`, (b) `ctx`
-  cancellation, or (c) `OLLAMA_TRACE_STEP_TIMEOUT`, which emits `step.timeout` and continues stepping.
-  An ack with `continue:true` releases the request permanently. An ack that arrives early is buffered (one credit).
-  Prefill events are emitted before the first wait.
-- If the hub socket is disconnected, step waits are skipped, so a crashed app never stalls Ollama.
-- Granularity is **token only**. `layer`/`sample` are accepted and behave as `token`, with `step_token_only` added
-  to `capabilities`.
-- **Step mode invalidates all timing stats.** llama-server keeps generating into the HTTP stream
-  while Go blocks in the per-token callback (TCP backpressure stalls it eventually). So
-  `eval_ms`/`prompt_eval_ms` in `request.done` describe llama-server's own run, and the `t_ns` gaps
-  between steps measure the user's clicks.
-- Verified live with a stub hub: an 8-step response took 964 ms with 100 ms-delayed acks, versus 164 ms free-running. With no acks
-  and a 300 ms timeout it took 2498 ms and emitted 8 `step.timeout` events.
-
-### Capability gaps (always reported in `request.received.capabilities`)
-
-`["no_layers","no_ops","no_residual","no_attn","no_kv_writes","no_sample_stages","no_tokenize_merge","prefill_synthesized"]`
-(+ `"step_token_only"` when `X-Trace-Step` is `layer`/`sample`). The list is the same at every detail level,
-because the emitter cannot produce any of these with stock llama-server. `layers` detail is accepted and
-echoed, but adds nothing over `basic`. `full` adds only `stream.chunk`.
-
-### TODO: C++ hooks for the layers/full tiers (needs patched llama.cpp, `LLAMA_CPP_VERSION=b11963`)
-
-These require building the native payload (VS2022 C++ tools + CMake ≥ 3.24 + Ninja,
-`cmake -B build . && cmake --build build`). Put the changes in a new `llama/compat/*.patch` so FetchContent applies them.
-
-1. **Eval callback: `decode.layer`, `prefill.layer`, `decode.op`, `decode.residual`, `decode.attn`, `decode.kv.write`.**
-   llama.cpp already threads `ggml_backend_sched_eval_callback` through `common_params::cb_eval` →
-   `llama_context_params::cb_eval` → `llama_context` constructor, which calls
-   `ggml_backend_sched_set_eval_callback(sched, cparams.cb_eval, cparams.cb_eval_user_data)` in
-   `src/llama-context.cpp`. `examples/eval-callback` is the reference user. In `tools/server/server.cpp`
-   (server context load), set `params_base.cb_eval` to a trace callback when a new `--trace` flag is given.
-   The callback is called with `ask=true` per node (return true only for nodes of interest) and then
-   with `ask=false` after the node is computed:
-   - timing: record a timestamp when a layer's first node is asked/computed and when its last node is computed. The layer index
-     is in the tensor name suffix (`attn_norm-12`, `Qcur-12`, `kq_soft_max-12`, `ffn_up-12`,
-     `ffn_out-12`, `l_out-12`). Classify into the op enum: `attn_norm`/`ffn_norm`→norm, `Qcur/Kcur/Vcur`→attn_qkv,
-     `kq`/`kq_soft_max`→attn_scores, `kqv_out`/`attn_out`→attn_out, `ffn_up`/`ffn_gate`→mlp_up,
-     `ffn_gelu`/`ffn_silu`→mlp_act, `ffn_down`/`ffn_out`→mlp_down. Note: asking for a node forces a scheduler
-     split and sync, which is the main `layers`/`full` cost. Batch per-layer timings with `OLLAMA_TRACE_LAYER_STRIDE`.
-   - residual: read back `l_out-N` for the last token only (`n_embd` floats), compute L2 norm and
-     delta vs. the previous layer on CPU.
-   - attention: read the last row of `kq_soft_max-N` (n_kv × n_head) for every 4th layer and reduce top-8 on CPU.
-     This is unavailable with flash attention (no materialized softmax), so emit `no_attn` when `-fa` is on.
-   - kv writes: the position is known from the ubatch (`llama_context::decode`, `ubatch.pos`), so emit one per layer per step.
-   - prefill.layer: the same callback during prompt ubatches (`n_tokens > 1`), indexed by ubatch.
-2. **Real prefill batches**: emit per ubatch from the decode loop in `llama_context::decode`
-   (`src/llama-context.cpp`) or per `n_batch` slice in `tools/server` `update_slots`.
-3. **Sampler stages: `decode.sample.stage`.** `common_sampler_sample` (`common/sampling.cpp`) applies the chain
-   built in `common_sampler_init`. Each stage is a `llama_sampler` applied by
-   `llama_sampler_chain_apply` in `src/llama-sampling.cpp`. Snapshot `cur_p` (top-64 by logit, plus the
-   `selected`/cutoff index) after each `llama_sampler_apply`, mapping sampler names (`penalties`, `top-k`, `top-p`,
-   `min-p`, `temp-ext`, `dist`) to the stage enum, and record the RNG draw in `llama_sampler_dist_apply`.
-4. **Transport from C++**: the simplest option is an extra per-token field in the existing SSE chunk
-   (e.g. `"trace":[…]` when `timings_per_token`-style flag `trace:true` is set). The Go side
-   (`llm/llama_server_trace.go`) would forward the field verbatim as events. That keeps one WebSocket owner and the
-   same `req`/`seq`. Alternatively, the callback could write NDJSON to a pipe that Ollama passes at spawn
-   (`llm/llama_server.go` spawn, ~:375–480).
-5. **Step mode at layer/sample granularity** has to block inside the callback (C++), with a condition variable
-   released by an ack that Go forwards (e.g. a new `POST /trace/ack` on llama-server).
-6. `tokenize.merge`: left to the app (JS BPE). A runner-side alternative would be in `llama_vocab::impl::tokenize`
-   (`src/llama-vocab.cpp`, BPE session `llm_tokenizer_bpe_session::tokenize`).
+Client isolation: tracing always asks llama-server for 10 logprobs. `userLogprobs` drops them unless the client
+set `logprobs`, and truncates `top_logprobs` to the client's value.
 
 ## Performance
 
-Setup: RTX 4060 8 GB, llama3.2 3B Q4_K_M fully offloaded, `/api/chat`, temperature 0, `num_predict: 300`,
-1 warm-up and 7 runs (5 for the logprobs runs), median of llama-server's `eval_count/eval_duration`. The stub hub is on localhost.
+Setup: RTX 4060 8 GB, CUDA 12.3, llama3.2 3B Q4_K_M fully offloaded, native payload from `build.md`
+(`C:\ollama-trace-full`), `/api/chat`, temperature 0, `num_predict: 300` (300 tokens each run),
+1 warm-up + 5 runs. The table gives the median of Ollama's `eval_count / eval_duration`. Recording
+hub on localhost. The user's other Ollama (port 11434) was running at the same time, with no requests from this benchmark.
 
-| Mode | decode tok/s | vs off | TTFT |
-|---|---|---|---|
-| tracing off (`OLLAMA_TRACE_URL` unset) | 105.1 (104.6 on a rerun) | — | 21.5 ms |
-| tracing `basic` | 94.7 | **−9.9 %** | 25.3 ms |
-| off, client asks `logprobs` + `top_logprobs:10` | 97.8 | −6.9 % | 22.2 ms |
-| off, client asks `logprobs` + `top_logprobs:1` | 97.9 | −6.8 % | 22.4 ms |
+| Mode | decode tok/s | vs off | TTFT | events / request |
+|---|---|---|---|---|
+| tracing off (`OLLAMA_TRACE_URL` unset) | **108.1** (108.2 / 108.0 / 108.1 / 108.3 / 107.9) | — | 21.5 ms | — |
+| `basic` | **98.3** | −9.1 % | 23.1 ms | ~1.2 k |
+| `layers` | **92.9** | −14.1 % (−5.5 % vs basic) | 25.3 ms | 3,447 |
+| `full` (stride 4, attention every 4th layer) | **64.0** | −40.8 % (−35 % vs basic) | 27.7 ms | 26,295 (0 dropped) |
+| `full`, `OLLAMA_TRACE_LAYER_STRIDE=1` | **34.4** | −68 % | 28.7 ms | 89,148 emitted |
 
-`basic` misses the < 2 % target. About 7 of the 10 points come from llama-server computing token
-probabilities at all. `n_probs > 0` makes it softmax and sort the full 128k vocab on the CPU for every token, whatever the
-k. The rest (~3 %) is `timings_per_token` plus per-chunk JSON on both sides. The Go emitter's own cost
-is small: it never blocks, and the hub received all 9 656 events of the 8 traced 300-token runs (1 207 per run, nothing dropped).
-The extra `/tokenize` (+`/apply-template`) call adds ~3–4 ms to TTFT.
-Options if this matters: (a) make `decode.logits` optional (an env/header that skips `n_probs`, leaving
-basic at ~−3 %), or (b) in C++, compute top-k with a partial sort over the logits (llama.cpp's
-`n_probs` path sorts the full vocab). `layers`/`full` were not benchmarked: without the C++ hooks they
-cost the same as `basic` (`full` adds only `stream.chunk`).
+- `basic` costs as before: about 7 of its 9 points are llama-server computing `n_probs` (softmax +
+  full-vocab sort per token), the rest is `timings_per_token` and per-chunk JSON.
+- `layers`/`full` add llama-server's own cost (llama.cpp README §8: −6 % / −35 % on CUDA vs its
+  no-trace run) plus Go-side parsing and re-emitting. `full` at stride 4 is about 87 events per token.
+  The Go side keeps up, and the hub received every event (no `seq` gaps).
+- At stride 1, ~300 events per token, the emitter's 10 000-event queue overflowed and ~42 % of the
+  droppable events (op/attn/residual/kv) were dropped. Every critical event arrived. The recording
+  hub appends each line to a file synchronously, so it was the slow consumer. Use stride 1 for short
+  runs or step mode, which forces stride 1 anyway.
+- With tracing off, `ollama.exe` sends byte-identical llama-server requests (unit-tested) and every
+  trace hook is a nil no-op (0 allocations).
 
-With tracing off, the patched build matched the off numbers above, and all trace calls take the nil fast path (0 allocations, unit-tested).
+Earlier Go-only numbers (stock 0.40.6 payload): off 105.1, `basic` 94.7 tok/s.
+
+## Known app-side observations (not changed here)
+
+- In the live Full-detail view at GPU speed, the app's playback clock falls behind (~87 events per token at
+  60–110 tok/s) and degrades by design. It skips full-tier events while lagging, so the forward-pass
+  and sampling panels can be empty at the end of a live run. Replaying the run (seek or step) shows
+  all the data.
+- `Session.continue()` resumes the clock but doesn't clear a pending *Step token/layer* stop
+  (`clock.stopWhen`). If Continue is clicked while a step is still pending, playback pauses again at
+  the next matching event, and the run stays in "decoding" until *Play* is pressed.
